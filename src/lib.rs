@@ -748,6 +748,11 @@ fn add_numbers(a: &dyn Array, values: &mut Vec<f64>, codes: &mut Vec<u8>, col: &
             }
         }
         DataType::Float32 => numbers::<Float32Type>(a, values, codes, f64::from),
+        // A column of nulls only (pyarrow's `null` type): every row is `.`.
+        DataType::Null => {
+            values.resize(values.len() + a.len(), f64::NAN);
+            codes.resize(codes.len() + a.len(), 1);
+        }
         DataType::Boolean => {
             let a = a.as_boolean();
             for i in 0..a.len() {

@@ -116,3 +116,15 @@ for (const f of fixtures()) {
     }
   });
 }
+
+// A column of pyarrow's `null` type (test/fixtures/null_column.parquet,
+// written by pyarrow 26.0.1 from `pa.table({"id": [1, 2, 3], "x": pa.nulls(3)})`):
+// every row is `.`, as 1.1.0 reads it.
+test("a column of nulls only reads as 1.1.0 reads it", () => {
+  const bytes = bytesOf(new URL("./fixtures/null_column.parquet", import.meta.url).pathname);
+  const a = pq.openParquet(bytes, OPTIONS);
+  const b = old.openParquet(bytes, OPTIONS);
+  assert.deepEqual(a.variables.map(variableOf), b.variables.map(variableOf));
+  assert.deepEqual(plain(a.readColumns([0, 1])), plain(b.readColumns([0, 1])));
+  assert.deepEqual(plain(a.readRowsAt([2, 0], [1, 0])), plain(b.readRowsAt([2, 0], [1, 0])));
+});
