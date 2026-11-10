@@ -795,6 +795,11 @@ fn add_bigints(a: &dyn Array, values: &mut Vec<i64>, codes: &mut Vec<u8>, col: &
         DataType::Timestamp(ArrowUnit::Millisecond, _) => bigints::<TimestampMillisecondType>(a, values, codes, |v| v),
         DataType::Timestamp(ArrowUnit::Microsecond, _) => bigints::<TimestampMicrosecondType>(a, values, codes, |v| v),
         DataType::Timestamp(ArrowUnit::Nanosecond, _) => bigints::<TimestampNanosecondType>(a, values, codes, |v| v),
+        // A column of nulls only: every row is `.`.
+        DataType::Null => {
+            values.resize(values.len() + a.len(), 0);
+            codes.resize(codes.len() + a.len(), 1);
+        }
         t => return Err(Fail(-2.0, format!("column \"{}\": {t} is not read as 64-bit integers", col.name))),
     }
     Ok(())
@@ -1033,4 +1038,26 @@ pub extern "C" fn pq_read_end() {
             st.directory = Vec::new();
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::NullArray;
+
+    // A column of nulls only is `.` in every row, read as numbers or as
+    // 64-bit integers (an INT64 column of logical type UNKNOWN reads as
+    // the second; no writer at hand makes one, so the array is built here).
+    #[test]
+    fn null_columns_are_missing() {
+        let a = NullArray::new(3);
+        let col = Column { name: "x", row: 0 };
+        let (mut values, mut codes) = (vec![1.0], vec![0]);
+        assert!(add_numbers(&a, &mut values, &mut codes, &col).is_ok());
+        assert_eq!(codes, [0, 1, 1, 1]);
+        assert!(values[1..].iter().all(|v| v.is_nan()));
+        let (mut values, mut codes) = (vec![7i64], vec![0]);
+        assert!(add_bigints(&a, &mut values, &mut codes, &col).is_ok());
+        assert_eq!((values, codes), (vec![7, 0, 0, 0], vec![0, 1, 1, 1]));
+    }
 }

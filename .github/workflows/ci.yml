@@ -24,6 +24,8 @@ jobs:
           node-version: 24
       - run: cargo fmt --check
       - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # The Rust unit tests, on the runner's own target.
+      - run: cargo test
       - run: sh scripts/build-wasm.sh
       - run: npm ci
       - run: npm run build
