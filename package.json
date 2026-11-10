@@ -1,0 +1,44 @@
+{
+  "name": "pqparser",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read Parquet files in Node, with @jbearak/dta-parser 1.1.0's Parquet API, over arrow-rs in wasm",
+  "license": "GPL-3.0-only",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    },
+    "./node": {
+      "types": "./dist/node.d.ts",
+      "default": "./dist/node.js"
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "node": [
+        "dist/node.d.ts"
+      ]
+    }
+  },
+  "files": [
+    "dist",
+    "THIRD-PARTY-NOTICES"
+  ],
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build:wasm": "sh scripts/build-wasm.sh",
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "devDependencies": {
+    "@jbearak/dta-parser": "1.1.0",
+    "@types/node": "24.19.2",
+    "typescript": "5.9.3"
+  }
+}

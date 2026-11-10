@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      # zstd's C code: Ubuntu's clang targets wasm32.
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy,rustfmt --target wasm32-unknown-unknown
+          rustup default stable
+      - name: Install clang and llvm
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: cargo fmt --check
+      - run: cargo clippy --target wasm32-unknown-unknown -- -D warnings
+      # The Rust unit tests, on the runner's own target.
+      - run: cargo test
+      - run: sh scripts/build-wasm.sh
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
