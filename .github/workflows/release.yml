@@ -81,11 +81,13 @@ jobs:
             echo '```'
           } > notes.md
           mv notes.md release/
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: release
           path: release/
           if-no-files-found: error
+          # "Re-run all jobs" builds again into the same run.
+          overwrite: true
 
   # Only this job can write, and it runs no code from the repository.
   publish:
@@ -152,12 +154,19 @@ jobs:
           # unties the draft from its tag ("untagged-..."). target_commitish
           # again: if the tag were deleted just now, publishing would make it
           # anew there, not on main's latest commit.
-          published="$(gh api -X PATCH "repos/$GH_REPO/releases/$id" -f tag_name="$tag" \
-            -f target_commitish="$GITHUB_SHA" -F draft=false --jq '.tag_name + " " + .html_url')"
-          echo "$published"
-          if [ "${published%% *}" != "$tag" ]; then
+          if ! gh api -X PATCH "repos/$GH_REPO/releases/$id" -f tag_name="$tag" \
+            -f target_commitish="$GITHUB_SHA" -F draft=false --jq .html_url; then
+            echo "The request to publish failed; reading the release to see whether it went through." >&2
+          fi
+          # What the release is now, whatever the PATCH answered.
+          state="$(gh api "repos/$GH_REPO/releases/$id" --jq '(.draft | tostring) + " " + .tag_name')"
+          if [ "${state%% *}" != "false" ]; then
+            echo "The release is still a draft; delete it before running again." >&2
+            exit 1
+          fi
+          if [ "${state#* }" != "$tag" ]; then
             gh api -X DELETE "repos/$GH_REPO/releases/$id"
-            echo "Publishing gave the release the tag ${published%% *}, not $tag; deleted it." >&2
+            echo "Publishing gave the release the tag ${state#* }, not $tag; deleted it." >&2
             exit 1
           fi
           # Publishing binds the release to the tag as it is now. If the tag
