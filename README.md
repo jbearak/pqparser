@@ -197,8 +197,10 @@ The release workflow (`.github/workflows/release.yml`) checks that the
 tag is `vX.Y.Z`, matches `package.json` and is on main; builds and tests
 the package with Rust 1.99.1 on Ubuntu 24.04; and attaches `npm pack`'s
 tarball and its SHA-256 to a GitHub release of the tag, made as a draft
-and published once both files are attached. If a run fails after
-making the draft, delete the draft before running it again.
+and published once both files are attached and the tag still names the
+commit that was built. A run refuses a tag that already has a release,
+even a draft: if a run fails after making the draft, delete the draft
+before running it again.
 
 A consumer's `package-lock.json` records the tarball's sha512, so a
 release, once made, is never replaced: a fix is a new version. The wasm

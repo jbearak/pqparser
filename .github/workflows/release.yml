@@ -11,6 +11,11 @@ on:
 permissions:
   contents: read
 
+# Two runs for one tag never overlap.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-24.04
@@ -92,22 +97,49 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: release
           path: release
-      - name: Check the tag still names the commit that was built
-        run: |
-          sha="$(gh api "repos/$GH_REPO/commits/$GITHUB_REF_NAME" --jq .sha)"
-          if [ "$sha" != "$GITHUB_SHA" ]; then
-            echo "$GITHUB_REF_NAME now names $sha, not $GITHUB_SHA, which was built." >&2
-            exit 1
-          fi
       - name: Release
         working-directory: release
         run: |
+          tag="$GITHUB_REF_NAME"
+          # The commit the tag names now, which must be the one built.
+          check_tag() {
+            sha="$(gh api "repos/$GH_REPO/commits/refs/tags/$tag" --jq .sha)"
+            if [ "$sha" != "$GITHUB_SHA" ]; then
+              echo "$tag now names $sha, not $GITHUB_SHA, which was built." >&2
+              return 1
+            fi
+          }
+          check_tag
+          # A release, draft or not, already made for this tag is never
+          # replaced or added to.
+          if [ "$(gh api "repos/$GH_REPO/releases" --paginate --jq ".[] | select(.tag_name == \"$tag\") | .id" | wc -l)" -ne 0 ]; then
+            echo "A release of $tag already exists; delete it if it is a failed run's draft." >&2
+            exit 1
+          fi
           # A draft until every file is attached, so a failed upload leaves
-          # no release that looks finished.
-          gh release create "$GITHUB_REF_NAME" pqparser-*.tgz pqparser-*.tgz.sha256 \
-            --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
-          gh release edit "$GITHUB_REF_NAME" --draft=false
+          # no release that looks finished. Everything after uses the
+          # draft's id, never its tag, which other drafts could share.
+          id="$(gh api "repos/$GH_REPO/releases" -f tag_name="$tag" -f name="$tag" \
+            -F body=@notes.md -F draft=true --jq .id)"
+          tarball="$(ls pqparser-*.tgz)"
+          for f in "$tarball" "$tarball.sha256"; do
+            gh api "https://uploads.github.com/repos/$GH_REPO/releases/$id/assets?name=$f" \
+              -H "Content-Type: application/octet-stream" --input "$f" --jq .name
+          done
+          attached="$(gh api "repos/$GH_REPO/releases/$id/assets" --jq '.[].name' | sort | tr '\n' ' ')"
+          if [ "$attached" != "$tarball $tarball.sha256 " ]; then
+            echo "The draft has $attached attached, not $tarball and its .sha256." >&2
+            exit 1
+          fi
+          check_tag
+          gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false --jq .html_url
+          # Publishing binds the release to the tag as it is now; if the tag
+          # moved in the moment since the check, take the release down.
+          if ! check_tag; then
+            gh api -X DELETE "repos/$GH_REPO/releases/$id"
+            exit 1
+          fi
