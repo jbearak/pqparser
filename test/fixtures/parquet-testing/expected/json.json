@@ -1,0 +1,1 @@
+{"rows":4,"columns":[{"name":"json_field","arrow_type":"extension<arrow.json>","values":["{\"a\":1}","{\"a\":1,\"b\":null}","[1,null,3]",null]}]}

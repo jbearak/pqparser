@@ -59,19 +59,19 @@ dictionary page, null count, minimum and maximum). From the `dta` profile
 variable labels, display formats, value label sets, categoricals with
 their levels, and DOUBLE columns written wider because they hold `.a` to
 `.z`. `.a` to `.z` are read from tagged NaNs into the missing codes 2 to
-27. Codecs: none, snappy, gzip, zstd and LZ4_RAW.
+27. Codecs: none, snappy, gzip, zstd, brotli, LZ4_RAW and LZ4 (in
+Hadoop's framing, or without it, as some writers made it): all but LZO,
+which arrow-rs does not read. DECIMAL of up to 15 digits reads as
+numbers; of more, as text with every digit, as 1.1.0 read it.
+
+Beyond 1.1.0 (see "Differences"): FLOAT16 as numbers, GEOMETRY and
+GEOGRAPHY as bytes (well-known binary, as pyarrow reads them), and a
+logical type newer than arrow-rs as its physical type.
 
 ## Differences from 1.1.0
 
 Dropped on purpose:
 
-- **brotli** (and LZO, and LZ4 in its Hadoop framing, which 1.1.0 did
-  not read either): the footer reads as before, and a read of a column
-  compressed so is an error naming the codec (`DTA_INVALID`).
-- **DECIMAL with more than 15 digits**, which 1.1.0 read as text: the
-  variable is there, with `columnKind: null` and a `notRead` that says
-  why, as for any column not read. DECIMAL of up to 15 digits reads as
-  numbers, as before.
 - **`nested: "skip"`**: refused. Nested columns are in `variables` with
   role `"nested"`, and reading them is an error naming them, as before.
 - **`pageCacheBytes`**: accepted and ignored. arrow-rs reads only the
@@ -84,20 +84,47 @@ Dropped on purpose:
   `maxStringBytes`, `toDate`, `dtaKey`, `formatValue`, and everything for
   `.dta` files.
 
+Read here and not by 1.1.0:
+
+- FLOAT16 (a `number` column of type `float16`, without statistics),
+  GEOMETRY and GEOGRAPHY (bytes), LZ4 in Hadoop's framing, ALP-encoded
+  floats, and data pages v2 with no bytes or with repetition levels on a
+  flat column.
+- Text that is not UTF-8 in a STRING, ENUM or JSON column: each value
+  that is not reads with its bad bytes replaced by U+FFFD (1.1.0 refused
+  the read). The first read that meets one reads it again so, and every
+  later read of the file reads text so.
+
 From arrow-rs:
 
 - `ColumnChunk.encodings` lists each encoding once, in the order of
   Parquet's enum (arrow-rs keeps them as a set); 1.1.0 kept the footer's
   order. They agree in every fixture; table-viewer only asks whether one
   is present.
-- arrow-rs checks the footer more strictly. A schema element whose
-  annotation does not fit its type (which 1.1.0 read as an unsupported
-  column) stops the file from opening. One case seen in the wild is
-  handled: Parquet2.jl writes a DECIMAL's precision and scale only in its
-  logical type, so the module adds them to the footer before arrow-rs
-  reads it.
-- Text that is not valid UTF-8 in a STRING column is an error; 1.1.0
-  replaced the bad bytes with U+FFFD.
+- arrow-rs checks the footer more strictly than 1.1.0 did. Where it
+  refuses a footer that other readers take, the module mends the footer
+  and reads it again:
+  - Parquet2.jl writes a DECIMAL's precision and scale only in its
+    logical type: they are added.
+  - An annotation that does not fit its physical type (UUID on an INT32,
+    TIMESTAMP on a FIXED_LEN_BYTE_ARRAY(12)) is dropped, and the column
+    read as its physical type, as parquet-testing's README asks of
+    readers; `info.warnings` names the column. 1.1.0 left such a column
+    out.
+  - A column chunk's field of the wrong Thrift type (Dremio writes a list
+    as `bloom_filter_length`) is left out, and a dictionary page offset
+    of 0 is read as none (the dictionary page is then the chunk's first
+    page).
+  - A file row count that is not the sum of the row groups' (parquet-rs
+    0.3 wrote 0) is taken from the row groups.
+  - An offset index that does not read is left out.
+- arrow-rs turns INT96 into nanoseconds since 1970 with wrapping
+  arithmetic, so a timestamp before 1677 or after 2262 (Spark writes
+  9999-12-31 so) comes out wrong. pqparser reads INT96 columns again in
+  seconds and makes such a value an error naming its row, as 1.1.0 did.
+
+Neither reads `nation.dict-malformed` from parquet-testing, whose
+dictionary pages run past their column chunks (pyarrow reads it).
 
 Damaged files give an `Error` with a `code` (`DTA_CORRUPT` for a damaged
 file, `DTA_IO` when the file system fails), never a crash: a panic in
@@ -134,9 +161,13 @@ The tests (node:test, `test/`):
 - `api.test.mjs`: options, error codes and classes, brotli, missing values.
 - `damaged.test.mjs`: truncated files, garbage, cut footers, and a
   thousand files with bytes changed.
+- `corpus.test.mjs`: Apache's parquet-testing corpus (70 files, see
+  `test/fixtures/parquet-testing/README.md`) against what pyarrow reads
+  from it (`scripts/expected.py`), with the exceptions listed in the test.
 
-The fixtures are dta-parser's `compat/parquet` files (commit 0ab136d);
-see `test/fixtures/README.md`.
+The fixtures are dta-parser's `compat/parquet` files (commit 0ab136d;
+see `test/fixtures/README.md`) and Apache's parquet-testing files
+(`test/fixtures/parquet-testing/README.md`).
 
 `node scripts/bench.mjs FILE.parquet` times a whole-file `readColumns`
 with pqparser and 1.1.0. `python3 scripts/notices.py` writes
@@ -144,10 +175,12 @@ with pqparser and 1.1.0. `python3 scripts/notices.py` writes
 
 ## Size
 
-The module is 2.95 MB (opt-level `"s"`), 501 KB brotli-compressed, which
-is how `dist/wasm-data.js` holds it (669 KB as base64). At opt-level `"z"`
-it was 2.5 MB but reads of numbers took twice as long; at 3, 4.1 MB and
-no faster than `"s"`.
+The module is 4.0 MB (opt-level `"s"`), 923 KB brotli-compressed, which
+is how `dist/wasm-data.js` holds it (1.23 MB as base64). The brotli codec
+is 1.05 MB of that (420 KB compressed): arrow-rs's codec can also
+compress, so brotli's encoder comes along. Without brotli, at opt-level
+`"z"` the module was 2.5 MB but reads of numbers took twice as long; at
+3, 4.1 MB and no faster than `"s"`.
 
 ## Speed
 
@@ -158,6 +191,10 @@ Whole-file `readColumns`, Node 26 on an Apple M-series laptop
 |---|---|---|
 | `hyparquet_delta` (the largest fixture, 600 rows, 76 KB) | 22 ms against 16 ms | 0.95 ms against 0.57 ms |
 | 1,000,000 rows, 5 columns, 19 MB, written by 1.1.0 | 100 ms against 136 ms | 69 ms against 98 ms |
+
+Those are 0.0.1's. 0.0.2's larger module (brotli) adds about 8 ms to
+the first call, and 0.2 ms (15%) to a warm read of `hyparquet_delta`
+(1.2 against 1.4 ms on the same machine and run).
 
 On small files pqparser is slower: each reader instantiates the module
 (0.3 ms), and arrow-rs costs more per read. On large ones it is faster,

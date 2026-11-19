@@ -1,5 +1,5 @@
 // What pqparser accepts and refuses: options, closed readers, rows and
-// variables out of range, nested columns, and the codecs it drops.
+// variables out of range, nested columns, and text that is not UTF-8.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { join } from "node:path";
@@ -41,15 +41,20 @@ test("errors carry 1.1.0's codes and classes", () => {
   same((r) => r.valueLabels("x"));
 });
 
-test("brotli is not read: the error names it, and the footer still is", () => {
-  for (const name of ["compat/pyarrow_brotli", "compat/fastparquet_int96_brotli", "compat/parquet2_brotli"]) {
-    const r = pq.openParquet(bytesOf(join(FIXTURES, `${name}.parquet`)), OPTIONS);
-    assert.ok(r.info.compression.includes("brotli"));
-    const k = r.variables.findIndex((v) => v.columnKind !== null);
-    assert.throws(() => r.readColumns([k]), (e) => e.code === "DTA_INVALID" && e.message === `column ${JSON.stringify(r.variables[k].name)}: brotli compression is not supported by pqparser`);
-    assert.throws(() => r.readRowsAt([0], [k]), code("DTA_INVALID"));
-    assert.deepEqual(r.readColumns([k], { start: 0, count: 0 })[0].missing?.length ?? 0, 0);
+// test/fixtures/not_utf8.parquet, written by pyarrow 26.0.1 from
+// `pa.array(vals, pa.binary()).view(pa.string())` as columns "plain" and
+// "coded" (`use_dictionary=["coded"]`), with vals
+// [b"ok", b"caf\xe9", None, b"ends \xe2\x82", b"\xac starts", b"caf\xe9", b"\xff\xfe"].
+// 1.1.0 refuses the file's reads.
+test("text that is not UTF-8 reads with each bad byte replaced, value by value", () => {
+  const r = pq.openParquet(bytesOf(join(FIXTURES, "not_utf8.parquet")), OPTIONS);
+  const want = ["ok", "caf\ufffd", "", "ends \ufffd", "\ufffd starts", "caf\ufffd", "\ufffd\ufffd"];
+  for (const c of r.readColumns([0, 1])) {
+    assert.deepEqual(c.values, want);
+    assert.deepEqual([...c.missing], [0, 0, 1, 0, 0, 0, 0]);
   }
+  assert.deepEqual(r.readRowsAt([6, 1], [1, 0]), [[want[6], want[6]], [want[1], want[1]]]);
+  r.close();
 });
 
 test("missing values are dta-parser 2's objects, shared through the realm", () => {

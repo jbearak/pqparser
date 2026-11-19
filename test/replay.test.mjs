@@ -13,8 +13,8 @@ const WINDOW_ROWS = 256;
 const BATCH_COLUMNS = 16;
 const REPEATING = new Set(["RLE_DICTIONARY", "PLAIN_DICTIONARY", "DELTA_BYTE_ARRAY"]);
 
-/** Everything table-viewer reads from `reader`, as plain data. `skip(v)` leaves a variable out of the table. */
-function session(reader, skip = () => false) {
+/** Everything table-viewer reads from `reader`, as plain data. */
+function session(reader) {
   const out = {};
   const { info, variables } = reader;
   // assert_parquet_limits
@@ -28,7 +28,7 @@ function session(reader, skip = () => false) {
   };
   const readable = [];
   variables.forEach((v, index) => {
-    if (v.columnKind !== null && !skip(v)) readable.push(index);
+    if (v.columnKind !== null) readable.push(index);
   });
   // assert_value_label_limits, then the column plans and their tooltips
   const labels = (name) => (name ? reader.valueLabels(name) : undefined);
@@ -128,19 +128,9 @@ test("table-viewer's session on bytes (git: URIs and compare originals)", () => 
   assert.deepEqual(session(pq.openParquet(bytes, OPTIONS)), session(old.openParquet(bytes, OPTIONS)));
 });
 
-test("table-viewer's session where a DECIMAL has more than 15 digits: the column is left out and named", () => {
+test("table-viewer's session where a DECIMAL has more than 15 digits: every digit, as text", () => {
   const bytes = bytesOf(join(FIXTURES, "compat/pyarrow_types.parquet"));
-  const wide = (v) => v.type === "decimal" && v.columnKind === "string";
-  const a = session(pq.openParquet(bytes, OPTIONS));
-  const b = session(old.openParquet(bytes, OPTIONS), wide);
-  const names = ["dec18", "dec38", "dec50"];
-  assert.deepEqual(a.leftOut.map(([n]) => n), names);
-  for (const [, role, why] of a.leftOut) {
-    assert.equal(role, "data");
-    assert.match(why, /^column "dec\d\d" is DECIMAL\(\d\d, \d+\), with more digits than a number holds, which is not read$/);
-  }
-  // 1.1.0's limits count those columns' dictionary pages; the rest is the same.
-  delete a.limits.dictionaries;
-  delete b.limits.dictionaries;
-  assert.deepEqual({ ...a, leftOut: [] }, { ...b, leftOut: [] });
+  const a = pq.openParquet(bytes, OPTIONS);
+  assert.deepEqual(a.variables.filter((v) => v.type === "decimal" && v.columnKind === "string").map((v) => v.name), ["dec18", "dec38", "dec50"]);
+  assert.deepEqual(session(a), session(old.openParquet(bytes, OPTIONS)));
 });

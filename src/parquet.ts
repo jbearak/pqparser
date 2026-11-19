@@ -68,7 +68,7 @@ export type Statistic = number | bigint | string | Uint8Array;
 export interface ColumnChunk {
   compressedBytes: number;
   uncompressedBytes: number;
-  /** The codec: `"snappy"`, `"zstd"`, `"gzip"`, `"lz4_raw"`, `"brotli"` or `"none"`. */
+  /** The codec: `"snappy"`, `"zstd"`, `"gzip"`, `"lz4_raw"`, `"lz4"`, `"brotli"`, `"lzo"` or `"none"`. */
   codec: string;
   /** The encodings it uses, such as `"PLAIN"` and `"RLE_DICTIONARY"` (in the order of Parquet's enum). */
   encodings: string[];
@@ -175,6 +175,8 @@ type RawChunk = [string, string[], number, number, number | null, number, number
 interface RawMeta {
   createdBy: string;
   keyValue: [string, number][];
+  /** Columns whose annotation did not fit their physical type, which is read instead, and arrow-rs's words. */
+  ignored: [string, string][];
   arrow: null | string | [string, boolean, string | null][];
   fields: RawField[];
   rowGroups: [number, RawChunk[]][];
@@ -182,7 +184,7 @@ interface RawMeta {
 
 /** What a column holds, from its Parquet types (1.1.0's `ColumnType`). */
 type Kind =
-  | { t: "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64" | "float" | "double" | "bool" | "text" | "binary" | "date" }
+  | { t: "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64" | "float16" | "float" | "double" | "bool" | "text" | "binary" | "date" }
   | { t: "timestamp" | "time"; unit: "ms" | "us" | "ns"; utc: boolean }
   | { t: "decimal"; precision: number; scale: number }
   | { t: "unsupported"; why: string };
@@ -230,7 +232,8 @@ function logicalName(l: RawLogical | null, converted: string): string {
 function kindOf(f: RawField): Kind {
   const [, , , rawLogical, converted, physical, length, precision, scale] = f;
   if (converted === "INTERVAL" && !rawLogical) return { t: "unsupported", why: "an INTERVAL, which this version does not read" };
-  let l = rawLogical && rawLogical[0] !== "UNKNOWN" ? rawLogical : null;
+  // A logical type newer than arrow-rs (_UNKNOWN) is ignored, as Parquet asks of readers.
+  let l = rawLogical && rawLogical[0] !== "UNKNOWN" && rawLogical[0] !== "_UNKNOWN" ? rawLogical : null;
   if (!l && converted === "DECIMAL") l = ["DECIMAL", precision ?? 0, scale ?? 0];
   if (!l) l = CONVERTED[converted] ?? null;
   const name = l?.[0];
@@ -250,9 +253,10 @@ function kindOf(f: RawField): Kind {
   } else if (name === "DATE" && physical === "INT32") return { t: "date" };
   else if ((name === "TIME" || name === "TIMESTAMP") && (physical === "INT32" || physical === "INT64")) {
     return { t: name === "TIME" ? "time" : "timestamp", unit: UNITS[l![1] as string], utc: l![2] as boolean };
-  } else if (name === "FLOAT16") return { t: "unsupported", why: "FLOAT16, which is not read" };
+  } else if (name === "FLOAT16" && physical === "FIXED_LEN_BYTE_ARRAY" && length === 2) return { t: "float16" };
   else if (physical === "BYTE_ARRAY" && (name === "STRING" || name === "ENUM" || name === "JSON")) return { t: "text" };
-  else if (physical === "BYTE_ARRAY" && (name === "BSON" || !l)) return { t: "binary" };
+  // GEOMETRY and GEOGRAPHY hold well-known binary, as pyarrow reads them.
+  else if (physical === "BYTE_ARRAY" && (name === "BSON" || name === "GEOMETRY" || name === "GEOGRAPHY" || !l)) return { t: "binary" };
   else if (physical === "FIXED_LEN_BYTE_ARRAY" && (!l || name === "UUID")) return { t: "binary" };
   else if (!l && physical === "INT32") return { t: "int32" };
   else if (!l && physical === "INT64") return { t: "int64" };
@@ -381,8 +385,8 @@ const NUMBER = 0;
 const BIGINT = 1;
 const TEXT = 2;
 const BYTES = 3;
-/** Codecs the module reads. */
-const CODECS = new Set(["none", "snappy", "gzip", "zstd", "lz4_raw"]);
+/** Codecs the module reads: all but LZO. `lz4` is LZ4 in Hadoop's framing, or (as some writers made it) without. */
+const CODECS = new Set(["none", "snappy", "gzip", "zstd", "lz4_raw", "lz4", "brotli"]);
 
 const utf8 = new TextDecoder("utf-8", { ignoreBOM: true });
 const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -411,9 +415,9 @@ function describe(
   else if (kind.t === "unsupported") notRead = `column "${name}" is ${kind.why}`;
   else if (kind.t === "text") [columnKind, mode] = extra.levels ? ["dictionary", TEXT] : ["string", TEXT];
   else if (kind.t === "binary") [columnKind, mode] = ["string", BYTES];
-  else if (kind.t === "decimal" && kind.precision > 15) {
-    notRead = `column "${name}" is DECIMAL(${kind.precision}, ${kind.scale}), with more digits than a number holds, which is not read`;
-  } else if (isInt64) {
+  // More digits than a double holds: every digit, as text.
+  else if (kind.t === "decimal" && kind.precision > 15) [columnKind, mode] = ["string", TEXT];
+  else if (isInt64) {
     const [number, reason] =
       int64 === "bigint"
         ? [false, 'int64: "bigint" was asked for']
@@ -491,7 +495,7 @@ const OLD_OK = new Set(["int8", "int16", "int32", "int64", "float", "double", "d
 function chunkOf(c: RawChunk, kind: Kind, physical: string, columnKind: ParquetVariable["columnKind"]): ColumnChunk {
   const [codec, encodings, compressedBytes, uncompressedBytes, dictionaryPageBytes, , nullCount, min, max, deprecated] = c;
   const stat = (s: number | string | null): Statistic | null => {
-    if (s === null || kind.t === "decimal" || physical === "INT96" || (deprecated && !OLD_OK.has(kind.t))) return null;
+    if (s === null || kind.t === "decimal" || kind.t === "float16" || physical === "INT96" || (deprecated && !OLD_OK.has(kind.t))) return null;
     switch (physical) {
       case "INT32":
         return ["uint8", "uint16", "uint32"].includes(kind.t) ? (s as number) >>> 0 : (s as number);
@@ -556,6 +560,7 @@ export class ParquetReader implements TableReader {
     read(tail, length - 8);
     const warnings: string[] = [];
     const warn = (w: string) => warnings.push(w);
+    for (const [name, why] of meta.ignored) warn(`column "${name}": its annotation does not fit its physical type, which is read instead (${why})`);
     const kvIndex = (key: string) => meta.keyValue.findIndex(([k]) => k === key);
     let profile: Profile | undefined;
     if (kvIndex("dta") >= 0) {
@@ -732,8 +737,7 @@ export class ParquetReader implements TableReader {
         const { firstRow, rows } = groups[g];
         const codec = vars[j].chunks[g]?.codec;
         if (firstRow < start + count && firstRow + rows > start && codec && !CODECS.has(codec)) {
-          const what = codec === "lz4" ? "the Hadoop framing of LZ4 (LZ4_RAW is read)" : `${codec} compression`;
-          throw dtaError("DTA_INVALID", `column ${JSON.stringify(this.variables[k].name)}: ${what} is not supported by pqparser`, undefined, TypeError);
+          throw dtaError("DTA_INVALID", `column ${JSON.stringify(this.variables[k].name)}: ${codec} compression is not supported by pqparser`, undefined, TypeError);
         }
       }
     }

@@ -1,0 +1,1 @@
+{"rows":6,"columns":[{"name":"a","arrow_type":"int64","values":[null,2,1,null,2,1]},{"name":"b","arrow_type":"string","values":["a","b","c","a","b","c"]}]}

@@ -1,15 +1,10 @@
 // pqparser against @jbearak/dta-parser 1.1.0, fixture by fixture: what
 // table-viewer reads (info, variables, value labels, columns in windows,
 // scattered rows) must be the same, value for value and missing code for
-// missing code. The differences made on purpose are asserted as such.
+// missing code.
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { OPTIONS, bytesOf, fixtures, old, plain, pq, rowsOf, usesBrotli, variableOf } from "./helpers.mjs";
-
-/** Variables pqparser does not read on purpose: DECIMAL with more than 15 digits, which 1.1.0 read as text. */
-function wideDecimal(v) {
-  return v.type === "decimal" && v.columnKind === "string";
-}
+import { OPTIONS, bytesOf, fixtures, old, plain, pq, rowsOf, variableOf } from "./helpers.mjs";
 
 /** Row windows: the start, across row groups, and the end. */
 function windows(nobs, groups) {
@@ -39,17 +34,7 @@ for (const f of fixtures()) {
     assert.equal(a.variables.length, b.variables.length);
     const readable = [];
     a.variables.forEach((v, k) => {
-      const w = b.variables[k];
-      if (wideDecimal(w)) {
-        assert.equal(v.columnKind, null, `${v.name}: not read`);
-        assert.match(v.notRead, /with more digits than a number holds/);
-        const { columnKind, notRead, ...rest } = variableOf(v);
-        const { columnKind: c2, ...want } = variableOf(w);
-        assert.equal(c2, "string");
-        assert.deepEqual(rest, want, v.name);
-        return;
-      }
-      assert.deepEqual(variableOf(v), variableOf(w), v.name);
+      assert.deepEqual(variableOf(v), variableOf(b.variables[k]), v.name);
       if (v.columnKind !== null) readable.push(k);
     });
     // Every set a variable names, and every set the profile holds.
@@ -58,11 +43,6 @@ for (const f of fixtures()) {
     names.add("no such set");
     for (const name of names) assert.deepEqual(plain([...(a.valueLabels(name) ?? [])]), plain([...(b.valueLabels(name) ?? [])]), `labels ${name}`);
 
-    if (usesBrotli(b)) {
-      // Dropped on purpose: every read names the codec.
-      if (readable.length) assert.throws(() => a.readColumns([readable[0]]), (e) => e.code === "DTA_INVALID" && /brotli compression is not supported/.test(e.message));
-      return;
-    }
     const nobs = a.info.nobs;
     for (const [start, count] of windows(nobs, a.info.rowGroups)) {
       const got = a.readColumns(readable, { start, count });
@@ -97,11 +77,9 @@ for (const f of fixtures()) {
       const b = old.openParquet(bytes, { ...OPTIONS, int64 });
       const readable = [];
       a.variables.forEach((v, k) => {
-        if (wideDecimal(b.variables[k])) return;
         assert.deepEqual(variableOf(v), variableOf(b.variables[k]), `${int64}: ${v.name}`);
         if (v.columnKind !== null) readable.push(k);
       });
-      if (usesBrotli(b)) continue;
       for (const k of readable) {
         let want;
         try {
