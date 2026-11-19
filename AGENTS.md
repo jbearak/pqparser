@@ -29,8 +29,11 @@ These are dta-parser's rules, and apply here as there.
 
 ## Publishing
 
-The package is private. Never publish it to npm or any other registry
-without the user's approval.
+The package is not on npm. Each version is a tarball attached to a
+GitHub release by `.github/workflows/release.yml` when a tag `vX.Y.Z` is
+pushed (see the README's Release section). Push a release tag only when
+the user asks for a release. Never publish the package to npm or any
+other registry without the user's approval.
 
 ## table-viewer
 

@@ -7,8 +7,12 @@ compiled to WebAssembly.
 It replaces the Parquet half of the npm package `@jbearak/dta-parser`
 1.1.0 for table-viewer: it
 exports the same names, with the same shapes, for everything table-viewer
-calls, so table-viewer switches by changing its imports. The package is
-private and is not published.
+calls, so table-viewer switches by changing its imports. It is not on
+npm: each version is a tarball attached to its
+[GitHub release](https://github.com/jbearak/pqparser/releases), which
+npm installs from the URL:
+
+    npm install https://github.com/jbearak/pqparser/releases/download/v0.0.3/pqparser-0.0.3.tgz
 
 ## Use
 
@@ -184,6 +188,16 @@ see `test/fixtures/README.md`) and Apache's parquet-testing files
 `node scripts/bench.mjs FILE.parquet` times a whole-file `readColumns`
 with pqparser and 1.1.0. `python3 scripts/notices.py` writes
 `THIRD-PARTY-NOTICES` after the crates change.
+
+## Release
+
+Set `version` in `package.json` (and `package-lock.json`), merge to
+main, then tag the merge commit `v` and the version and push the tag.
+The release workflow (`.github/workflows/release.yml`) checks that the
+tag matches `package.json` and is on main, builds and tests the package
+with a pinned Rust, and attaches `npm pack`'s tarball and its SHA-256
+to a GitHub release of the tag. A release, once made, is not replaced:
+a fix is a new version.
 
 ## Size
 

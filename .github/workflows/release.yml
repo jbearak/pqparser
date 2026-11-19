@@ -1,0 +1,78 @@
+name: release
+
+# Pushing a tag vX.Y.Z builds the package from that commit, tests it, and
+# attaches the tarball `npm pack` makes, with its SHA-256, to a GitHub
+# release of the tag. Nothing is published to npm.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    env:
+      # zstd's C code: Ubuntu's clang targets wasm32.
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+      # Pinned so that a release can be built again byte for byte.
+      RUST_VERSION: "1.99.1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check the tag
+        run: |
+          version="v$(node -p 'require("./package.json").version')"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "The tag is $GITHUB_REF_NAME but package.json says $version." >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_REF_NAME is not on main." >&2
+            exit 1
+          fi
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_VERSION"
+      - name: Install clang and llvm
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: sh scripts/build-wasm.sh
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Pack
+        run: |
+          tarball="$(npm pack --silent)"
+          sha256sum "$tarball" > "$tarball.sha256"
+          echo "TARBALL=$tarball" >> "$GITHUB_ENV"
+      - name: Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "Built and tested by the release workflow from $GITHUB_SHA."
+            echo
+            echo '```'
+            cat "$TARBALL.sha256"
+            echo '```'
+            echo
+            echo "- $(rustc --version)"
+            echo "- $(clang --version | head -n 1)"
+            echo "- Node $(node --version)"
+            echo
+            echo "Install with npm from the tarball's URL:"
+            echo
+            echo '```'
+            echo "npm install https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$TARBALL"
+            echo '```'
+          } > notes.md
+          gh release create "$GITHUB_REF_NAME" "$TARBALL" "$TARBALL.sha256" \
+            --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
