@@ -1,6 +1,6 @@
 {
   "name": "pqparser",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "private": true,
   "description": "Read Parquet files in Node, with @jbearak/dta-parser 1.1.0's Parquet API, over arrow-rs in wasm",
   "license": "GPL-3.0-only",

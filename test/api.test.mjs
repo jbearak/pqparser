@@ -77,6 +77,23 @@ test("a BYTE_ARRAY of nulls only, and a DECIMAL of 15 digits in 17 bytes, read a
   assert.deepEqual(plain(r.readColumns([0, 1])), plain(b.readColumns([0, 1])));
 });
 
+test("scattered rows read without decoding the rows between them", () => {
+  // 16 columns of 130,000 doubles; 2,048 rows 60 apart. Decoding every row
+  // between them (arrow-rs's mask) grew the module's memory by about 50 MB.
+  const n = 130_000;
+  const bytes = old.writeParquet({
+    variables: Array.from({ length: 16 }, (_, k) => ({ name: `d${k}`, type: "double", values: Float64Array.from({ length: n }, (_, i) => i * 7 + k) })),
+  });
+  const r = pq.openParquet(bytes, OPTIONS);
+  const memory = () => r.core.exports.memory.buffer.byteLength;
+  const before = memory();
+  const rows = Array.from({ length: 2048 }, (_, i) => i * 60 + (i % 3));
+  const got = r.readRowsAt(rows);
+  assert.deepEqual(got.map((row) => row[5]), rows.map((i) => i * 7 + 5));
+  assert.ok(memory() - before < 24 << 20, `the module grew by ${(memory() - before) >> 20} MB`);
+  r.close();
+});
+
 test("a file that does not end in PAR1 does not open", () => {
   const bytes = Buffer.from(bytesOf(join(FIXTURES, "compat/pyarrow_default.parquet")));
   bytes.write("BAD!", bytes.length - 4);

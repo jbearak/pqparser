@@ -18,7 +18,9 @@ use arrow_array::{Array, ArrowPrimitiveType};
 use arrow_schema::{DataType, TimeUnit as ArrowUnit};
 use base64::Engine as _;
 use bytes::Bytes;
-use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
+use parquet::arrow::arrow_reader::{
+    ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelectionPolicy, RowSelector,
+};
 use parquet::arrow::ProjectionMask;
 use parquet::basic::{Compression, LogicalType, TimeUnit};
 use parquet::file::metadata::{FileMetaData, PageIndexPolicy, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader};
@@ -217,8 +219,41 @@ struct Loaded {
     ignored: Vec<(String, String)>,
 }
 
-fn with_indexes(r: ParquetMetaDataReader) -> ParquetMetaDataReader {
-    r.with_column_index_policy(PageIndexPolicy::Skip).with_offset_index_policy(PageIndexPolicy::Optional)
+/// The most bytes the offset indexes may span: arrow-rs reads them in one
+/// piece, gaps between them included.
+const MAX_INDEX_SPAN: i64 = 64 << 20;
+
+/// Whether the file has offset indexes, spanning at most `MAX_INDEX_SPAN` bytes.
+fn offset_indexes_fit(meta: &ParquetMetaData) -> bool {
+    let (mut lo, mut hi) = (i64::MAX, i64::MIN);
+    for c in meta.row_groups().iter().flat_map(|g| g.columns()) {
+        if let (Some(at), Some(n)) = (c.offset_index_offset(), c.offset_index_length()) {
+            lo = lo.min(at);
+            hi = hi.max(at.saturating_add(i64::from(n)));
+        }
+    }
+    lo <= hi && hi.saturating_sub(lo) <= MAX_INDEX_SPAN
+}
+
+/// The footer alone: the offset indexes are read after, by `with_offset_indexes`.
+fn footer_only(r: ParquetMetaDataReader) -> ParquetMetaDataReader {
+    r.with_column_index_policy(PageIndexPolicy::Skip).with_offset_index_policy(PageIndexPolicy::Skip)
+}
+
+/// The metadata with the offset indexes, when the file has them, they span
+/// at most `MAX_INDEX_SPAN` bytes, and they read. They only spare a read
+/// some pages, so without them a file reads the same.
+fn with_offset_indexes(file: &Host, meta: ParquetMetaData) -> ParquetMetaData {
+    if !offset_indexes_fit(&meta) {
+        return meta;
+    }
+    let mut r = ParquetMetaDataReader::new_with_metadata(meta.clone())
+        .with_column_index_policy(PageIndexPolicy::Skip)
+        .with_offset_index_policy(PageIndexPolicy::Optional);
+    match r.read_page_indexes(file).and_then(|_| r.finish()) {
+        Ok(m) => m,
+        Err(_) => meta,
+    }
 }
 
 /// The file's footer as bytes.
@@ -239,9 +274,9 @@ fn footer_bytes(file: &Host) -> Result<Vec<u8>, String> {
 
 /// The footer, and the offset indexes when there are any and they read.
 fn load(file: &Host) -> Result<Loaded, String> {
-    let e = match with_indexes(ParquetMetaDataReader::new()).parse_and_finish(file) {
+    let e = match footer_only(ParquetMetaDataReader::new()).parse_and_finish(file) {
         Ok(meta) if !zero_dictionary_offset(&meta) && !unknown_logical(&meta) => {
-            return Ok(Loaded { meta: true_rows(meta), footer: None, ignored: Vec::new() })
+            return Ok(Loaded { meta: true_rows(with_offset_indexes(file, meta)), footer: None, ignored: Vec::new() })
         }
         Ok(_) => None,
         Err(e) => Some(e.to_string()),
@@ -280,8 +315,6 @@ fn load(file: &Host) -> Result<Loaded, String> {
         };
         footer = mended.ok_or(e)?;
     };
-    // An offset index only spares a read some pages: one that does not read
-    // (or is damaged) is left out.
     if zero_dictionary_offset(&meta) {
         footer = drop_misfit_fields(&footer).ok_or("a column chunk's dictionary page is at byte 0")?;
         meta = ParquetMetaDataReader::decode_metadata(&footer).map_err(|e| e.to_string())?;
@@ -293,12 +326,7 @@ fn load(file: &Host) -> Result<Loaded, String> {
         footer = drop_unknown_logical(&footer).ok_or("the footer could not be mended")?;
         meta = ParquetMetaDataReader::decode_metadata(&footer).map_err(|e| e.to_string())?;
     }
-    let mut r = with_indexes(ParquetMetaDataReader::new_with_metadata(meta.clone()));
-    let meta = match r.read_page_indexes(file).and_then(|_| r.finish()) {
-        Ok(m) => m,
-        Err(_) => meta,
-    };
-    Ok(Loaded { meta: true_rows(meta), footer: Some(footer), ignored })
+    Ok(Loaded { meta: true_rows(with_offset_indexes(file, meta)), footer: Some(footer), ignored })
 }
 
 /// The metadata with the file's rows the sum of its row groups' rows,
@@ -1396,6 +1424,8 @@ fn read(state: &mut State, fields: &[usize], modes: &[u8], ranges: &[(u64, u64)]
             .with_row_groups(groups)
             .with_row_selection(RowSelection::from(select))
             .with_batch_size(count.clamp(1, 1 << 16) as usize)
+            // Skip the rows between those asked for: a mask would decode them.
+            .with_row_selection_policy(RowSelectionPolicy::Selectors)
             .build()
             .map_err(|e| e.to_string())?;
         let mut at = 0;
@@ -1458,6 +1488,8 @@ fn check_int96(state: &mut State, fields: &[usize], names: &[&str], outs: &[Out]
         .with_row_groups(groups)
         .with_row_selection(RowSelection::from(select))
         .with_batch_size(count.clamp(1, 1 << 16) as usize)
+        // Skip the rows between those asked for: a mask would decode them.
+        .with_row_selection_policy(RowSelectionPolicy::Selectors)
         .build()
         .map_err(|e| e.to_string())?;
     let mut at = 0usize;
@@ -1582,6 +1614,34 @@ mod tests {
     // A column of nulls only is `.` in every row, read as numbers or as
     // 64-bit integers (an INT64 column of logical type UNKNOWN reads as
     // the second; no writer at hand makes one, so the array is built here).
+    // Offset indexes are read only when they span at most MAX_INDEX_SPAN
+    // bytes: arrow-rs reads them in one piece, gaps included.
+    #[test]
+    fn offset_indexes_are_read_only_when_close_together() {
+        use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
+        use parquet::schema::{parser::parse_message_type, types::SchemaDescriptor};
+        let schema = Arc::new(SchemaDescriptor::new(Arc::new(parse_message_type("message s { required int32 a; }").unwrap())));
+        let meta = |at: &[(i64, i32)]| {
+            let groups = at
+                .iter()
+                .map(|&(offset, length)| {
+                    let c = ColumnChunkMetaData::builder(schema.column(0))
+                        .set_offset_index_offset(Some(offset))
+                        .set_offset_index_length(Some(length))
+                        .build()
+                        .unwrap();
+                    RowGroupMetaData::builder(schema.clone()).set_num_rows(1).set_column_metadata(vec![c]).build().unwrap()
+                })
+                .collect();
+            ParquetMetaData::new(FileMetaData::new(1, at.len() as i64, None, None, schema.clone(), None), groups)
+        };
+        assert!(!offset_indexes_fit(&ParquetMetaData::new(FileMetaData::new(1, 0, None, None, schema.clone(), None), vec![])));
+        assert!(offset_indexes_fit(&meta(&[(1_000, 20), (1_020, 20)])));
+        assert!(offset_indexes_fit(&meta(&[(4, 20), (MAX_INDEX_SPAN - 16, 20)])));
+        assert!(!offset_indexes_fit(&meta(&[(4, 20), (MAX_INDEX_SPAN - 15, 20)])));
+        assert!(!offset_indexes_fit(&meta(&[(4, 20), (i64::MAX - 5, 20)])));
+    }
+
     #[test]
     fn null_columns_are_missing() {
         let a = NullArray::new(3);
