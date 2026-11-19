@@ -630,11 +630,13 @@ fn drop_annotation(footer: &[u8], name: &str, which: &[usize]) -> Option<(Vec<u8
 /// The footer without the annotations arrow-rs refused (error `e`) on
 /// elements named `name`, keeping those of the same name it takes.
 /// arrow-rs names only the first element it refuses, and several may give
-/// the same error. A binary search finds a first `k` elements whose
-/// annotations, dropped, change the error, where the first `k - 1` do not:
-/// the `k`th is one arrow-rs refuses. If dropping it alone changes the
-/// error, that is all; else each of the others is put back unless that
-/// brings the error back.
+/// the same error. A binary search finds a `k` where dropping the first
+/// `k` elements' annotations changes the error and dropping the first
+/// `k - 1` does not (not always the smallest such `k`: dropping one refused
+/// element can bring out another's different error). If dropping the
+/// `k`th alone changes the error, that is all; else each of the others is
+/// put back unless that brings the error back. The caller reads the footer
+/// again and mends whatever error is left.
 fn drop_misfits(footer: &[u8], name: &str, e: &str) -> Option<Vec<u8>> {
     let fixed = |which: &[usize]| {
         let (f, _) = drop_annotation(footer, name, which)?;
@@ -646,7 +648,7 @@ fn drop_misfits(footer: &[u8], name: &str, e: &str) -> Option<Vec<u8>> {
     let first = |k: usize| (0..k).collect::<Vec<usize>>();
     let (_, n) = drop_annotation(footer, name, &[])?;
     fixed(&first(n))?;
-    // Dropping none leaves the error; dropping the first `hi` changes it.
+    // Dropping the first `lo` leaves the error; dropping the first `hi` changes it.
     let (mut lo, mut hi) = (0, n);
     while hi - lo > 1 {
         let mid = (lo + hi) / 2;
