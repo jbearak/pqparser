@@ -96,6 +96,8 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       GH_REPO: ${{ github.repository }}
+      # A failed `git ls-remote` fails at once instead of asking for a login.
+      GIT_TERMINAL_PROMPT: "0"
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
@@ -105,26 +107,36 @@ jobs:
         working-directory: release
         run: |
           tag="$GITHUB_REF_NAME"
-          # The commit the tag names now, which must be the one built.
+          # Whether the tag still names the commit that was built: 0 if it
+          # does, 1 if it names another or is gone, 2 if the lookup failed.
           check_tag() {
-            sha="$(gh api "repos/$GH_REPO/commits/refs/tags/$tag" --jq .sha)"
+            if ! refs="$(git ls-remote "https://github.com/$GH_REPO" "refs/tags/$tag" "refs/tags/$tag^{}")"; then
+              echo "Could not look up $tag." >&2
+              return 2
+            fi
+            # An annotated tag's commit is on its ^{} line.
+            sha="$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$tag^{}" '$2 == ref { print $1 }')"
+            if [ -z "$sha" ]; then
+              sha="$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$tag" '$2 == ref { print $1 }')"
+            fi
             if [ "$sha" != "$GITHUB_SHA" ]; then
-              echo "$tag now names $sha, not $GITHUB_SHA, which was built." >&2
+              echo "$tag now names ${sha:-nothing}, not $GITHUB_SHA, which was built." >&2
               return 1
             fi
           }
           check_tag
           # A release, draft or not, already made for this tag is never
           # replaced or added to.
-          if [ "$(gh api "repos/$GH_REPO/releases" --paginate --jq ".[] | select(.tag_name == \"$tag\") | .id" | wc -l)" -ne 0 ]; then
+          existing="$(gh api "repos/$GH_REPO/releases" --paginate --jq ".[] | select(.tag_name == \"$tag\") | .id")"
+          if [ -n "$existing" ]; then
             echo "A release of $tag already exists; delete it if it is a failed run's draft." >&2
             exit 1
           fi
           # A draft until every file is attached, so a failed upload leaves
           # no release that looks finished. Everything after uses the
           # draft's id, never its tag, which other drafts could share.
-          id="$(gh api "repos/$GH_REPO/releases" -f tag_name="$tag" -f name="$tag" \
-            -F body=@notes.md -F draft=true --jq .id)"
+          id="$(gh api "repos/$GH_REPO/releases" -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" \
+            -f name="$tag" -F body=@notes.md -F draft=true --jq .id)"
           tarball="$(ls pqparser-*.tgz)"
           for f in "$tarball" "$tarball.sha256"; do
             gh api "https://uploads.github.com/repos/$GH_REPO/releases/$id/assets?name=$f" \
@@ -136,10 +148,32 @@ jobs:
             exit 1
           fi
           check_tag
-          gh api -X PATCH "repos/$GH_REPO/releases/$id" -F draft=false --jq .html_url
-          # Publishing binds the release to the tag as it is now; if the tag
-          # moved in the moment since the check, take the release down.
-          if ! check_tag; then
+          # tag_name again, because a PATCH of a draft that leaves it out
+          # unties the draft from its tag ("untagged-..."). target_commitish
+          # again: if the tag were deleted just now, publishing would make it
+          # anew there, not on main's latest commit.
+          published="$(gh api -X PATCH "repos/$GH_REPO/releases/$id" -f tag_name="$tag" \
+            -f target_commitish="$GITHUB_SHA" -F draft=false --jq '.tag_name + " " + .html_url')"
+          echo "$published"
+          if [ "${published%% *}" != "$tag" ]; then
             gh api -X DELETE "repos/$GH_REPO/releases/$id"
+            echo "Publishing gave the release the tag ${published%% *}, not $tag; deleted it." >&2
+            exit 1
+          fi
+          # Publishing binds the release to the tag as it is now. If the tag
+          # moved in the moment since the check, take the release down; if
+          # it cannot be looked up, say so and leave the release alone.
+          for _ in 1 2 3; do
+            status=0
+            check_tag || status=$?
+            [ "$status" -ne 2 ] || { sleep 10; continue; }
+            break
+          done
+          if [ "$status" -eq 1 ]; then
+            gh api -X DELETE "repos/$GH_REPO/releases/$id"
+            echo "Deleted the release." >&2
+            exit 1
+          elif [ "$status" -ne 0 ]; then
+            echo "Published, but could not check that $tag still names $GITHUB_SHA; check it by hand." >&2
             exit 1
           fi
