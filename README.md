@@ -77,7 +77,8 @@ Dropped on purpose:
 - **`pageCacheBytes`**: accepted and ignored. arrow-rs reads only the
   pages a read needs (with an offset index; without one, it reads the
   page headers before them too) and keeps none, so neighbouring windows
-  decompress a page again.
+  decompress a page again. `readRowsAt` reads every row asked for in one
+  pass, so each page it needs is decompressed once.
 - Not here, since table-viewer does not use them: `openParquetAsync` and
   `AsyncParquetReader`, the writers, `characteristics()`, `notes()`,
   `keyValue()`, `readColumns`' `strings: "dictionary"` and
@@ -92,8 +93,10 @@ Read here and not by 1.1.0:
   flat column.
 - Text that is not UTF-8 in a STRING, ENUM or JSON column: each value
   that is not reads with its bad bytes replaced by U+FFFD (1.1.0 refused
-  the read). The first read that meets one reads it again so, and every
-  later read of the file reads text so.
+  the read). arrow-rs checks STRING columns: the first read that meets
+  one reads it again as bytes, and every later read of the file reads
+  text so. It checks neither ENUM (read as bytes) nor JSON columns, whose
+  values are mended as they are copied out.
 
 From arrow-rs:
 
@@ -106,11 +109,16 @@ From arrow-rs:
   and reads it again:
   - Parquet2.jl writes a DECIMAL's precision and scale only in its
     logical type: they are added.
-  - An annotation that does not fit its physical type (UUID on an INT32,
-    TIMESTAMP on a FIXED_LEN_BYTE_ARRAY(12)) is dropped, and the column
-    read as its physical type, as parquet-testing's README asks of
-    readers; `info.warnings` names the column. 1.1.0 left such a column
-    out.
+  - An annotation that does not fit its physical type (UUID on an INT32
+    or a FIXED_LEN_BYTE_ARRAY(4), TIMESTAMP on a FIXED_LEN_BYTE_ARRAY(12))
+    is dropped, and the column read as its physical type, as
+    parquet-testing's README asks of readers; `info.warnings` names the
+    column. Only that element's: of the elements with the name arrow-rs
+    gives, the first whose annotation, dropped, changes arrow-rs's answer.
+    1.1.0 left such a column out.
+  - A logical type newer than arrow-rs (on an integer, arrow-rs would
+    refuse to read any column) is dropped, and the column read as its
+    physical type, as Parquet asks of readers.
   - A column chunk's field of the wrong Thrift type (Dremio writes a list
     as `bloom_filter_length`) is left out, and a dictionary page offset
     of 0 is read as none (the dictionary page is then the chunk's first
@@ -194,7 +202,10 @@ Whole-file `readColumns`, Node 26 on an Apple M-series laptop
 
 Those are 0.0.1's. 0.0.2's larger module (brotli) adds about 8 ms to
 the first call, and 0.2 ms (15%) to a warm read of `hyparquet_delta`
-(1.2 against 1.4 ms on the same machine and run).
+(1.2 against 1.4 ms on the same machine and run). `readRowsAt` of 256
+scattered rows of a 1,000,000-row file with 262,144-row row groups of
+1 MB pages, one DOUBLE column: 10 ms (0.0.1: 170 ms, one pass per run of
+nearby rows; 1.1.0, with its page cache: 17 ms).
 
 On small files pqparser is slower: each reader instantiates the module
 (0.3 ms), and arrow-rs costs more per read. On large ones it is faster,

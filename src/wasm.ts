@@ -14,7 +14,7 @@ interface Exports {
   pq_open(len: number): number;
   pq_meta(): number;
   pq_key_value(k: number): number;
-  pq_read(fields: number, modes: number, n: number, start: number, count: number): number;
+  pq_read(fields: number, modes: number, n: number, ranges: number, r: number): number;
   pq_directory(): number;
   pq_read_end(): void;
 }

@@ -686,18 +686,18 @@ export class ParquetReader implements TableReader {
     const start = range.start ?? 0;
     const count = range.count ?? this.info.nobs - start;
     this.rows(start, count);
-    return this.gather(idx, start, count);
+    return this.gather(idx, [[start, count]]);
   }
 
   /** Rows as arrays of cells, one per variable asked for (default: all); a null is `MISSING["."]`. */
   readRows(start: number, count: number, columns?: readonly (number | string)[]): TableCell[][] {
     const idx = columns ? columns.map((c) => this.index(c)) : this.all();
     this.rows(start, count);
-    const cols = this.gather(idx, start, count);
+    const cols = this.gather(idx, [[start, count]]);
     return Array.from({ length: count }, (_, i) => cols.map((c) => cellOf(c, i)));
   }
 
-  /** The rows listed, in their order (repeats allowed), as `readRows` gives them. Nearby rows are read together. */
+  /** The rows listed, in their order (repeats allowed), as `readRows` gives them. They are read together, each page once. */
   readRowsAt(rows: readonly number[], columns?: readonly (number | string)[]): TableCell[][] {
     const idx = columns ? columns.map((c) => this.index(c)) : this.all();
     for (const r of rows) {
@@ -705,25 +705,28 @@ export class ParquetReader implements TableReader {
         throw dtaError("DTA_OUT_OF_RANGE", `row ${r} is outside 0 to ${this.info.nobs - 1}`, undefined, RangeError);
       }
     }
-    const spans: { start: number; count: number }[] = [];
+    // Runs of consecutive rows, read in one pass.
+    const ranges: [number, number][] = [];
+    const where = new Map<number, number>();
     for (const r of Float64Array.from(new Set(rows)).sort()) {
-      const last = spans[spans.length - 1];
-      if (last && r - (last.start + last.count) < 64) last.count = r - last.start + 1;
-      else spans.push({ start: r, count: 1 });
+      const last = ranges[ranges.length - 1];
+      if (last && r === last[0] + last[1]) last[1]++;
+      else ranges.push([r, 1]);
+      where.set(r, where.size);
     }
-    const where = new Map<number, [TableColumn[], number]>();
-    for (const s of spans) {
-      const cols = this.gather(idx, s.start, s.count);
-      for (let i = 0; i < s.count; i++) where.set(s.start + i, [cols, i]);
-    }
+    const cols = this.gather(idx, ranges);
     return rows.map((r) => {
-      const [cols, i] = where.get(r)!;
+      const i = where.get(r)!;
       return cols.map((c) => cellOf(c, i));
     });
   }
 
-  /** Rows `start` to `start + count` of the variables at `idx`, read in calls of at most `STEP` rows. */
-  private gather(idx: number[], start: number, count: number): TableColumn[] {
+  /**
+   * The rows of `ranges` ([start, count], ascending and apart) of the
+   * variables at `idx`, end to end, read in calls of at most `STEP` rows.
+   */
+  private gather(idx: number[], ranges: [number, number][]): TableColumn[] {
+    const count = ranges.reduce((n, r) => n + r[1], 0);
     const core = this.open;
     const distinct = [...new Set(idx)].sort((a, b) => a - b);
     const vars = distinct.map((k) => this.variables[k]);
@@ -736,7 +739,8 @@ export class ParquetReader implements TableReader {
       for (let g = 0; g < groups.length && count > 0; g++) {
         const { firstRow, rows } = groups[g];
         const codec = vars[j].chunks[g]?.codec;
-        if (firstRow < start + count && firstRow + rows > start && codec && !CODECS.has(codec)) {
+        const read = ranges.some(([start, n]) => n > 0 && firstRow < start + n && firstRow + rows > start);
+        if (read && codec && !CODECS.has(codec)) {
           throw dtaError("DTA_INVALID", `column ${JSON.stringify(this.variables[k].name)}: ${codec} compression is not supported by pqparser`, undefined, TypeError);
         }
       }
@@ -756,12 +760,20 @@ export class ParquetReader implements TableReader {
     const levels = vars.map((v) => new Map((v.categorical?.levels ?? []).map((l, i) => [l, i])));
     const fields = Uint32Array.from(distinct);
     const modes = Uint8Array.from(distinct, (k) => this.modes[k]);
-    for (const [at, n] of this.calls(start, count)) {
-      core.with([new Uint8Array(fields.buffer), modes], ([f, m]) => {
+    // The file row of output row `i`, for messages.
+    const rowOf = (i: number): number => {
+      for (const [start, n] of ranges) {
+        if (i < n) return start + i;
+        i -= n;
+      }
+      return -1;
+    };
+    for (const { at, n, ranges: part } of this.calls(ranges)) {
+      core.with([new Uint8Array(fields.buffer), modes, new Uint8Array(Float64Array.from(part).buffer)], ([f, m, r]) => {
         try {
-          core.call((x) => x.pq_read(f, m, distinct.length, start + at, n));
+          core.call((x) => x.pq_read(f, m, distinct.length, r, part.length / 2));
           const dir = core.typed(Uint32Array, core.call((x) => x.pq_directory()), 11 * distinct.length).slice();
-          vars.forEach((v, j) => place(core, out[j], dir.subarray(11 * j, 11 * j + 11), at, n, v, levels[j], start));
+          vars.forEach((v, j) => place(core, out[j], dir.subarray(11 * j, 11 * j + 11), at, n, v, levels[j], rowOf));
         } finally {
           core.readEnd();
         }
@@ -780,12 +792,33 @@ export class ParquetReader implements TableReader {
   }
 
   /**
-   * The module calls a read of rows `start` to `start + count` makes, as
-   * [first row from `start`, rows]: whole row groups together up to `STEP`
-   * rows, a larger one in parts, so that each call holds at most `STEP` rows
-   * and a page is rarely decoded twice.
+   * The module calls a read of `ranges` makes: each with where its rows go
+   * in the output (`at`, `n`) and the ranges it reads, as start, count,
+   * start, count..., at most `STEP` rows a call.
    */
-  private calls(start: number, count: number): [number, number][] {
+  private calls(ranges: [number, number][]): { at: number; n: number; ranges: number[] }[] {
+    const out: { at: number; n: number; ranges: number[] }[] = [];
+    let at = 0;
+    for (const [start, count] of ranges) {
+      for (const [from, take] of this.pieces(start, count)) {
+        const last = out[out.length - 1];
+        if (last && last.n + take <= STEP) {
+          last.ranges.push(start + from, take);
+          last.n += take;
+        } else out.push({ at, n: take, ranges: [start + from, take] });
+        at += take;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Rows `start` to `start + count` in pieces, as [first row from `start`,
+   * rows]: whole row groups together up to `STEP` rows, a larger one in
+   * parts, so that each holds at most `STEP` rows and a page is rarely
+   * decoded twice.
+   */
+  private pieces(start: number, count: number): [number, number][] {
     const out: [number, number][] = [];
     const end = start + count;
     let at = start;
@@ -826,7 +859,7 @@ const CODED = 4;
 const NULL = 0xffffffff;
 
 /** Copy one call's column `d` (src/lib.rs's directory) into `col` from row `at`. */
-function place(core: Core, col: TableColumn, d: Uint32Array, at: number, n: number, v: ParquetVariable, levels: Map<string, number>, start: number): void {
+function place(core: Core, col: TableColumn, d: Uint32Array, at: number, n: number, v: ParquetVariable, levels: Map<string, number>, rowOf: (i: number) => number): void {
   if (col.kind === "number") {
     col.values.set(core.typed(Float64Array, d[1], d[2]), at);
     col.missing.set(core.view(d[3], d[4]), at);
@@ -885,7 +918,7 @@ function place(core: Core, col: TableColumn, d: Uint32Array, at: number, n: numb
       let k = levels.get(entries[e]);
       if (k === undefined) {
         if (fixed) {
-          throw dtaError("DTA_INVALID", `column ${JSON.stringify(v.name)}: the value ${JSON.stringify(entries[e])} in row ${start + at + i + 1} is not one of the levels in the dta profile`, undefined, TypeError);
+          throw dtaError("DTA_INVALID", `column ${JSON.stringify(v.name)}: the value ${JSON.stringify(entries[e])} in row ${rowOf(at + i) + 1} is not one of the levels in the dta profile`, undefined, TypeError);
         }
         k = col.values.length;
         col.values.push(entries[e]);

@@ -57,6 +57,16 @@ def main():
         d = source(name, version)
         toml = (d / "Cargo.toml").read_text()
         text = next(((d / f).read_text() for f in PREFER if (d / f).is_file()), None)
+        if text is None:
+            # brotli ships its two licences as LICENSE.BSD-3-Clause and LICENSE.MIT: both.
+            both = sorted(d.glob("LICENSE.*"))
+            if both:
+                text = "\n\n".join(f"{f.name}:\n\n{f.read_text().strip()}" for f in both)
+        if text is None and name == "alloc-stdlib":
+            # alloc-stdlib ships no licence file: it comes from the repository
+            # alloc-no-stdlib does (dropbox/rust-alloc-no-stdlib), whose licence this is.
+            text = "(The crate's package has no licence file; this is alloc-no-stdlib's, from the same repository.)\n\n"
+            text += (source("alloc-no-stdlib", versions["alloc-no-stdlib"]) / "LICENSE").read_text()
         if text is None and field(toml, "license") == "Apache-2.0":
             # flatbuffers ships no licence file: the licence's text, from arrow-schema's copy.
             text = "(The crate's package has no licence file; this is the Apache License 2.0 it names.)\n\n"

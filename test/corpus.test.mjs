@@ -1,14 +1,14 @@
-// Apache Parquet's test corpus (test/fixtures/parquet-testing): every file
-// opens, every flat column is read, and its values are pyarrow's, by the
-// rules of pyarrow.test.mjs. The exceptions are listed here, each with
-// what pqparser does instead and why.
+// Apache Parquet's test corpus (test/fixtures/parquet-testing), and files
+// whose footers arrow-rs refuses (test/fixtures/odd, scripts/make_odd.py):
+// every file opens, every flat column is read, and its values are
+// pyarrow's, by the rules of pyarrow.test.mjs. The exceptions are listed
+// here, each with what pqparser does instead and why.
 import assert from "node:assert/strict";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { FIXTURES, OPTIONS, cell, parseExact, pq, same } from "./helpers.mjs";
 
-const DIR = join(FIXTURES, "parquet-testing");
 
 /** Files whose reading differs from pyarrow's, and what is checked instead. */
 const EXCEPTIONS = {
@@ -44,15 +44,23 @@ const EXCEPTIONS = {
 /** Warnings a file is expected to give. */
 const WARNINGS = {
   int32_with_uuid_logical_type: [/^column "int32_uuid": its annotation does not fit its physical type, which is read instead \(Cannot annotate Uuid from INT32/],
+  // Only the struct's member loses its annotation, not the text column of the same name.
+  misfit_same_name: [/^column "x": its annotation does not fit its physical type, which is read instead \(Logical type Uuid is incompatible with converted type INT_8/],
+  uuid_four_bytes: [/^column "uid": its annotation does not fit its physical type, which is read instead \(UUID cannot annotate field 'uid'/],
+  // A DATE converted type with a logical type newer than arrow-rs: both go, as pyarrow reads it.
+  unknown_logical_int: [/^column "d": its annotation does not fit its physical type, which is read instead \(Logical type _Unknown/],
 };
 
-const files = readdirSync(DIR).filter((f) => f.endsWith(".parquet")).sort();
+const files = (set) => readdirSync(join(FIXTURES, set)).filter((f) => f.endsWith(".parquet")).sort();
 
-test("the corpus is all here", () => assert.equal(files.length, 70));
+test("the corpus is all here", () => assert.equal(files("parquet-testing").length, 70));
 
-for (const file of files) {
+for (const [set, file] of ["parquet-testing", "odd"].flatMap((set) => files(set).map((f) => [set, f]))) {
   const name = file.slice(0, -".parquet".length);
-  test(`parquet-testing/${name}`, () => {
+  const DIR = join(FIXTURES, set);
+  // Checked in api.test.mjs: pyarrow does not read it.
+  if (name === "null_text_and_wide_decimal") continue;
+  test(`${set}/${name}`, () => {
     const want = parseExact(readFileSync(join(DIR, "expected", `${name}.json`), "utf8"));
     const r = pq.openParquet(readFileSync(join(DIR, file)), OPTIONS);
     for (const v of r.variables) if (v.role !== "nested") assert.notEqual(v.columnKind, null, `${v.name}: ${v.notRead}`);
