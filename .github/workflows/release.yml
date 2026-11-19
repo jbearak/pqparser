@@ -1,0 +1,188 @@
+name: release
+
+# Pushing a tag vX.Y.Z builds the package from that commit, tests it, and
+# attaches the tarball `npm pack` makes, with its SHA-256, to a GitHub
+# release of the tag. Nothing is published to npm.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+# Two runs for one tag never overlap.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      # zstd's C code: Ubuntu's clang targets wasm32.
+      CC_wasm32_unknown_unknown: clang
+      AR_wasm32_unknown_unknown: llvm-ar
+      # The Rust each release is built with, named in its notes.
+      RUST_VERSION: "1.99.1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check the tag
+        run: |
+          if ! printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "$GITHUB_REF_NAME is not a release tag vX.Y.Z." >&2
+            exit 1
+          fi
+          version="v$(node -p 'require("./package.json").version')"
+          if [ "$version" != "$GITHUB_REF_NAME" ]; then
+            echo "The tag is $GITHUB_REF_NAME but package.json says $version." >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "$GITHUB_REF_NAME is not on main." >&2
+            exit 1
+          fi
+      - name: Install Rust
+        run: |
+          rustup toolchain install "$RUST_VERSION" --profile minimal --target wasm32-unknown-unknown
+          rustup default "$RUST_VERSION"
+      - name: Install clang and llvm
+        run: sudo apt-get update && sudo apt-get install -y clang llvm
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - run: sh scripts/build-wasm.sh
+      - run: npm ci
+      - run: npm run build
+      - run: npm test
+      - name: Pack
+        run: |
+          mkdir release
+          tarball="$(npm pack --silent --pack-destination release)"
+          (cd release && sha256sum "$tarball" > "$tarball.sha256")
+          {
+            echo "Built and tested by the release workflow from $GITHUB_SHA."
+            echo
+            echo '```'
+            cat "release/$tarball.sha256"
+            echo '```'
+            echo
+            echo "- $(rustc --version)"
+            echo "- $(clang --version | head -n 1)"
+            echo "- Node $(node --version)"
+            echo
+            echo "Install with npm from the tarball's URL, which records the tarball's sha512 in package-lock.json:"
+            echo
+            echo '```'
+            echo "npm install https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$tarball"
+            echo '```'
+          } > notes.md
+          mv notes.md release/
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+          # "Re-run all jobs" builds again into the same run.
+          overwrite: true
+
+  # Only this job can write, and it runs no code from the repository.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # A failed `git ls-remote` fails at once instead of asking for a login.
+      GIT_TERMINAL_PROMPT: "0"
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release
+          path: release
+      - name: Release
+        working-directory: release
+        run: |
+          tag="$GITHUB_REF_NAME"
+          # Whether the tag still names the commit that was built: 0 if it
+          # does, 1 if it names another or is gone, 2 if the lookup failed.
+          check_tag() {
+            if ! refs="$(git ls-remote "https://github.com/$GH_REPO" "refs/tags/$tag" "refs/tags/$tag^{}")"; then
+              echo "Could not look up $tag." >&2
+              return 2
+            fi
+            # An annotated tag's commit is on its ^{} line.
+            sha="$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$tag^{}" '$2 == ref { print $1 }')"
+            if [ -z "$sha" ]; then
+              sha="$(printf '%s\n' "$refs" | awk -v ref="refs/tags/$tag" '$2 == ref { print $1 }')"
+            fi
+            if [ "$sha" != "$GITHUB_SHA" ]; then
+              echo "$tag now names ${sha:-nothing}, not $GITHUB_SHA, which was built." >&2
+              return 1
+            fi
+          }
+          check_tag
+          # A release, draft or not, already made for this tag is never
+          # replaced or added to.
+          existing="$(gh api "repos/$GH_REPO/releases" --paginate --jq ".[] | select(.tag_name == \"$tag\") | .id")"
+          if [ -n "$existing" ]; then
+            echo "A release of $tag already exists; delete it if it is a failed run's draft." >&2
+            exit 1
+          fi
+          # A draft until every file is attached, so a failed upload leaves
+          # no release that looks finished. Everything after uses the
+          # draft's id, never its tag, which other drafts could share.
+          id="$(gh api "repos/$GH_REPO/releases" -f tag_name="$tag" -f target_commitish="$GITHUB_SHA" \
+            -f name="$tag" -F body=@notes.md -F draft=true --jq .id)"
+          tarball="$(ls pqparser-*.tgz)"
+          for f in "$tarball" "$tarball.sha256"; do
+            gh api "https://uploads.github.com/repos/$GH_REPO/releases/$id/assets?name=$f" \
+              -H "Content-Type: application/octet-stream" --input "$f" --jq .name
+          done
+          attached="$(gh api "repos/$GH_REPO/releases/$id/assets" --jq '.[].name' | sort | tr '\n' ' ')"
+          if [ "$attached" != "$tarball $tarball.sha256 " ]; then
+            echo "The draft has $attached attached, not $tarball and its .sha256." >&2
+            exit 1
+          fi
+          check_tag
+          # tag_name again, because a PATCH of a draft that leaves it out
+          # unties the draft from its tag ("untagged-..."). target_commitish
+          # again: if the tag were deleted just now, publishing would make it
+          # anew there, not on main's latest commit.
+          if ! gh api -X PATCH "repos/$GH_REPO/releases/$id" -f tag_name="$tag" \
+            -f target_commitish="$GITHUB_SHA" -F draft=false --jq .html_url; then
+            echo "The request to publish failed; reading the release to see whether it went through." >&2
+          fi
+          # What the release is now, whatever the PATCH answered.
+          state="$(gh api "repos/$GH_REPO/releases/$id" --jq '(.draft | tostring) + " " + .tag_name')"
+          if [ "${state%% *}" != "false" ]; then
+            echo "The release is still a draft; delete it before running again." >&2
+            exit 1
+          fi
+          if [ "${state#* }" != "$tag" ]; then
+            gh api -X DELETE "repos/$GH_REPO/releases/$id"
+            echo "Publishing gave the release the tag ${state#* }, not $tag; deleted it." >&2
+            exit 1
+          fi
+          # Publishing binds the release to the tag as it is now. If the tag
+          # moved in the moment since the check, take the release down; if
+          # it cannot be looked up, say so and leave the release alone.
+          for _ in 1 2 3; do
+            status=0
+            check_tag || status=$?
+            [ "$status" -ne 2 ] || { sleep 10; continue; }
+            break
+          done
+          if [ "$status" -eq 1 ]; then
+            gh api -X DELETE "repos/$GH_REPO/releases/$id"
+            echo "Deleted the release." >&2
+            exit 1
+          elif [ "$status" -ne 0 ]; then
+            echo "Published, but could not check that $tag still names $GITHUB_SHA; check it by hand." >&2
+            exit 1
+          fi

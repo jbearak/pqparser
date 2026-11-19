@@ -37,6 +37,6 @@ CFLAGS_wasm32_unknown_unknown="${CFLAGS_wasm32_unknown_unknown:--Os}"
 RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }--remap-path-prefix=${CARGO_HOME:-$HOME/.cargo}=cargo --remap-path-prefix=$(pwd)=pqparser"
 export RUSTFLAGS
 export CFLAGS_wasm32_unknown_unknown
-${CARGO:-cargo} build --release --target wasm32-unknown-unknown
+${CARGO:-cargo} build --release --locked --target wasm32-unknown-unknown
 mkdir -p build
 cp target/wasm32-unknown-unknown/release/pqparser.wasm build/pqparser.wasm
