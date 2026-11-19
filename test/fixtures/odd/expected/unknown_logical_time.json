@@ -1,0 +1,1 @@
+{"rows":3,"columns":[{"name":"n","arrow_type":"int64","values":[1,2,null]},{"name":"t","arrow_type":"int64","values":[0,5000000000,null]}]}

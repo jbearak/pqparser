@@ -1,6 +1,6 @@
 [package]
 name = "pqparser"
-version = "0.0.1"
+version = "0.0.2"
 edition = "2021"
 rust-version = "1.88"
 license = "GPL-3.0-only"
@@ -12,8 +12,8 @@ crate-type = ["cdylib"]
 path = "src/lib.rs"
 
 [dependencies]
-# Read only; brotli and the Hadoop framing of LZ4 are left out on purpose.
-parquet = { version = "=60.1.0", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "flate2-rust_backend"] }
+# Read only. Every codec arrow-rs reads: LZO is the one it does not.
+parquet = { version = "=60.1.0", default-features = false, features = ["arrow", "snap", "zstd", "lz4", "brotli", "flate2-rust_backend"] }
 arrow-array = { version = "=60.1.0", default-features = false }
 arrow-schema = "=60.1.0"
 arrow-ipc = { version = "=60.1.0", default-features = false }

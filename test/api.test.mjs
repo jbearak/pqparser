@@ -1,9 +1,9 @@
 // What pqparser accepts and refuses: options, closed readers, rows and
-// variables out of range, nested columns, and the codecs it drops.
+// variables out of range, nested columns, and text that is not UTF-8.
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { join } from "node:path";
-import { FIXTURES, OPTIONS, bytesOf, old, pq } from "./helpers.mjs";
+import { FIXTURES, OPTIONS, bytesOf, old, plain, pq } from "./helpers.mjs";
 
 const bytes = bytesOf(join(FIXTURES, "compat/pyarrow_nested.parquet"));
 const code = (c) => (e) => e.code === c;
@@ -41,15 +41,46 @@ test("errors carry 1.1.0's codes and classes", () => {
   same((r) => r.valueLabels("x"));
 });
 
-test("brotli is not read: the error names it, and the footer still is", () => {
-  for (const name of ["compat/pyarrow_brotli", "compat/fastparquet_int96_brotli", "compat/parquet2_brotli"]) {
-    const r = pq.openParquet(bytesOf(join(FIXTURES, `${name}.parquet`)), OPTIONS);
-    assert.ok(r.info.compression.includes("brotli"));
-    const k = r.variables.findIndex((v) => v.columnKind !== null);
-    assert.throws(() => r.readColumns([k]), (e) => e.code === "DTA_INVALID" && e.message === `column ${JSON.stringify(r.variables[k].name)}: brotli compression is not supported by pqparser`);
-    assert.throws(() => r.readRowsAt([0], [k]), code("DTA_INVALID"));
-    assert.deepEqual(r.readColumns([k], { start: 0, count: 0 })[0].missing?.length ?? 0, 0);
+// test/fixtures/not_utf8.parquet, written by pyarrow 26.0.1 from
+// `a = pa.array(vals, pa.binary()).view(pa.string())` as columns "plain",
+// "coded" (`use_dictionary=["coded"]`) and "json"
+// (`pa.ExtensionArray.from_storage(pa.json_(), a)`), with vals
+// [b"ok", b"caf\xe9", None, b"ends \xe2\x82", b"\xac starts", b"caf\xe9", b"\xff\xfe"].
+// 1.1.0 refuses the file's reads.
+test("text that is not UTF-8 reads with each bad byte replaced, value by value", () => {
+  const bytes = bytesOf(join(FIXTURES, "not_utf8.parquet"));
+  const want = ["ok", "caf\ufffd", "", "ends \ufffd", "\ufffd starts", "caf\ufffd", "\ufffd\ufffd"];
+  // JSON, which arrow-rs does not check, read first and alone.
+  const json = pq.openParquet(bytes, OPTIONS);
+  assert.deepEqual(json.readColumns(["json"])[0].values, want);
+  json.close();
+  const r = pq.openParquet(bytes, OPTIONS);
+  for (const c of r.readColumns([0, 1, 2])) {
+    assert.deepEqual(c.values, want);
+    assert.deepEqual([...c.missing], [0, 0, 1, 0, 0, 0, 0]);
   }
+  assert.deepEqual(r.readRowsAt([6, 1], [1, 0]), [[want[6], want[6]], [want[1], want[1]]]);
+  r.close();
+});
+
+// test/fixtures/odd/null_text_and_wide_decimal.parquet, written by
+// arrow-rs's SerializedFileWriter from `optional binary u (UNKNOWN)` (3
+// nulls) and `required fixed_len_byte_array(17) d (DECIMAL(15, 2))` (12.34,
+// -0.05, 999999999999.99). pyarrow refuses a DECIMAL in 17 bytes.
+test("a BYTE_ARRAY of nulls only, and a DECIMAL of 15 digits in 17 bytes, read as 1.1.0 reads them", () => {
+  const bytes = bytesOf(join(FIXTURES, "odd/null_text_and_wide_decimal.parquet"));
+  const r = pq.openParquet(bytes, OPTIONS);
+  const [u, d] = r.readColumns([0, 1]);
+  assert.deepEqual([...u.missing], [1, 1, 1]);
+  assert.deepEqual([...d.values], [12.34, -0.05, 999999999999.99]);
+  const b = old.openParquet(bytes, OPTIONS);
+  assert.deepEqual(plain(r.readColumns([0, 1])), plain(b.readColumns([0, 1])));
+});
+
+test("a file that does not end in PAR1 does not open", () => {
+  const bytes = Buffer.from(bytesOf(join(FIXTURES, "compat/pyarrow_default.parquet")));
+  bytes.write("BAD!", bytes.length - 4);
+  assert.throws(() => pq.openParquet(bytes, OPTIONS), code("DTA_CORRUPT"));
 });
 
 test("missing values are dta-parser 2's objects, shared through the realm", () => {

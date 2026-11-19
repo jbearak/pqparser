@@ -1,0 +1,1 @@
+{"rows":1,"columns":[{"name":"ID","arrow_type":"int64","values":[8]}],"nested":["Int_Array","int_array_array","Int_Map","int_map_array","nested_Struct"]}

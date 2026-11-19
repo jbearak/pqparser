@@ -1,0 +1,1 @@
+{"rows":3,"columns":[{"name":"x'y","arrow_type":"int32","values":[1,null,3]},{"name":"z","arrow_type":"double","values":[1.5,2.5,null]}]}

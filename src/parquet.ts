@@ -68,7 +68,7 @@ export type Statistic = number | bigint | string | Uint8Array;
 export interface ColumnChunk {
   compressedBytes: number;
   uncompressedBytes: number;
-  /** The codec: `"snappy"`, `"zstd"`, `"gzip"`, `"lz4_raw"`, `"brotli"` or `"none"`. */
+  /** The codec: `"snappy"`, `"zstd"`, `"gzip"`, `"lz4_raw"`, `"lz4"`, `"brotli"`, `"lzo"` or `"none"`. */
   codec: string;
   /** The encodings it uses, such as `"PLAIN"` and `"RLE_DICTIONARY"` (in the order of Parquet's enum). */
   encodings: string[];
@@ -175,6 +175,8 @@ type RawChunk = [string, string[], number, number, number | null, number, number
 interface RawMeta {
   createdBy: string;
   keyValue: [string, number][];
+  /** Columns whose annotation did not fit their physical type, which is read instead, and arrow-rs's words. */
+  ignored: [string, string][];
   arrow: null | string | [string, boolean, string | null][];
   fields: RawField[];
   rowGroups: [number, RawChunk[]][];
@@ -182,7 +184,7 @@ interface RawMeta {
 
 /** What a column holds, from its Parquet types (1.1.0's `ColumnType`). */
 type Kind =
-  | { t: "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64" | "float" | "double" | "bool" | "text" | "binary" | "date" }
+  | { t: "int8" | "int16" | "int32" | "int64" | "uint8" | "uint16" | "uint32" | "uint64" | "float16" | "float" | "double" | "bool" | "text" | "binary" | "date" }
   | { t: "timestamp" | "time"; unit: "ms" | "us" | "ns"; utc: boolean }
   | { t: "decimal"; precision: number; scale: number }
   | { t: "unsupported"; why: string };
@@ -230,7 +232,8 @@ function logicalName(l: RawLogical | null, converted: string): string {
 function kindOf(f: RawField): Kind {
   const [, , , rawLogical, converted, physical, length, precision, scale] = f;
   if (converted === "INTERVAL" && !rawLogical) return { t: "unsupported", why: "an INTERVAL, which this version does not read" };
-  let l = rawLogical && rawLogical[0] !== "UNKNOWN" ? rawLogical : null;
+  // A logical type newer than arrow-rs (_UNKNOWN) is ignored, as Parquet asks of readers.
+  let l = rawLogical && rawLogical[0] !== "UNKNOWN" && rawLogical[0] !== "_UNKNOWN" ? rawLogical : null;
   if (!l && converted === "DECIMAL") l = ["DECIMAL", precision ?? 0, scale ?? 0];
   if (!l) l = CONVERTED[converted] ?? null;
   const name = l?.[0];
@@ -250,9 +253,10 @@ function kindOf(f: RawField): Kind {
   } else if (name === "DATE" && physical === "INT32") return { t: "date" };
   else if ((name === "TIME" || name === "TIMESTAMP") && (physical === "INT32" || physical === "INT64")) {
     return { t: name === "TIME" ? "time" : "timestamp", unit: UNITS[l![1] as string], utc: l![2] as boolean };
-  } else if (name === "FLOAT16") return { t: "unsupported", why: "FLOAT16, which is not read" };
+  } else if (name === "FLOAT16" && physical === "FIXED_LEN_BYTE_ARRAY" && length === 2) return { t: "float16" };
   else if (physical === "BYTE_ARRAY" && (name === "STRING" || name === "ENUM" || name === "JSON")) return { t: "text" };
-  else if (physical === "BYTE_ARRAY" && (name === "BSON" || !l)) return { t: "binary" };
+  // GEOMETRY and GEOGRAPHY hold well-known binary, as pyarrow reads them.
+  else if (physical === "BYTE_ARRAY" && (name === "BSON" || name === "GEOMETRY" || name === "GEOGRAPHY" || !l)) return { t: "binary" };
   else if (physical === "FIXED_LEN_BYTE_ARRAY" && (!l || name === "UUID")) return { t: "binary" };
   else if (!l && physical === "INT32") return { t: "int32" };
   else if (!l && physical === "INT64") return { t: "int64" };
@@ -381,8 +385,8 @@ const NUMBER = 0;
 const BIGINT = 1;
 const TEXT = 2;
 const BYTES = 3;
-/** Codecs the module reads. */
-const CODECS = new Set(["none", "snappy", "gzip", "zstd", "lz4_raw"]);
+/** Codecs the module reads: all but LZO. `lz4` is LZ4 in Hadoop's framing, or (as some writers made it) without. */
+const CODECS = new Set(["none", "snappy", "gzip", "zstd", "lz4_raw", "lz4", "brotli"]);
 
 const utf8 = new TextDecoder("utf-8", { ignoreBOM: true });
 const strictUtf8 = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
@@ -411,9 +415,9 @@ function describe(
   else if (kind.t === "unsupported") notRead = `column "${name}" is ${kind.why}`;
   else if (kind.t === "text") [columnKind, mode] = extra.levels ? ["dictionary", TEXT] : ["string", TEXT];
   else if (kind.t === "binary") [columnKind, mode] = ["string", BYTES];
-  else if (kind.t === "decimal" && kind.precision > 15) {
-    notRead = `column "${name}" is DECIMAL(${kind.precision}, ${kind.scale}), with more digits than a number holds, which is not read`;
-  } else if (isInt64) {
+  // More digits than a double holds: every digit, as text.
+  else if (kind.t === "decimal" && kind.precision > 15) [columnKind, mode] = ["string", TEXT];
+  else if (isInt64) {
     const [number, reason] =
       int64 === "bigint"
         ? [false, 'int64: "bigint" was asked for']
@@ -491,7 +495,7 @@ const OLD_OK = new Set(["int8", "int16", "int32", "int64", "float", "double", "d
 function chunkOf(c: RawChunk, kind: Kind, physical: string, columnKind: ParquetVariable["columnKind"]): ColumnChunk {
   const [codec, encodings, compressedBytes, uncompressedBytes, dictionaryPageBytes, , nullCount, min, max, deprecated] = c;
   const stat = (s: number | string | null): Statistic | null => {
-    if (s === null || kind.t === "decimal" || physical === "INT96" || (deprecated && !OLD_OK.has(kind.t))) return null;
+    if (s === null || kind.t === "decimal" || kind.t === "float16" || physical === "INT96" || (deprecated && !OLD_OK.has(kind.t))) return null;
     switch (physical) {
       case "INT32":
         return ["uint8", "uint16", "uint32"].includes(kind.t) ? (s as number) >>> 0 : (s as number);
@@ -556,6 +560,7 @@ export class ParquetReader implements TableReader {
     read(tail, length - 8);
     const warnings: string[] = [];
     const warn = (w: string) => warnings.push(w);
+    for (const [name, why] of meta.ignored) warn(`column "${name}": its annotation does not fit its physical type, which is read instead (${why})`);
     const kvIndex = (key: string) => meta.keyValue.findIndex(([k]) => k === key);
     let profile: Profile | undefined;
     if (kvIndex("dta") >= 0) {
@@ -681,18 +686,18 @@ export class ParquetReader implements TableReader {
     const start = range.start ?? 0;
     const count = range.count ?? this.info.nobs - start;
     this.rows(start, count);
-    return this.gather(idx, start, count);
+    return this.gather(idx, [[start, count]]);
   }
 
   /** Rows as arrays of cells, one per variable asked for (default: all); a null is `MISSING["."]`. */
   readRows(start: number, count: number, columns?: readonly (number | string)[]): TableCell[][] {
     const idx = columns ? columns.map((c) => this.index(c)) : this.all();
     this.rows(start, count);
-    const cols = this.gather(idx, start, count);
+    const cols = this.gather(idx, [[start, count]]);
     return Array.from({ length: count }, (_, i) => cols.map((c) => cellOf(c, i)));
   }
 
-  /** The rows listed, in their order (repeats allowed), as `readRows` gives them. Nearby rows are read together. */
+  /** The rows listed, in their order (repeats allowed), as `readRows` gives them. They are read together, each page once. */
   readRowsAt(rows: readonly number[], columns?: readonly (number | string)[]): TableCell[][] {
     const idx = columns ? columns.map((c) => this.index(c)) : this.all();
     for (const r of rows) {
@@ -700,25 +705,28 @@ export class ParquetReader implements TableReader {
         throw dtaError("DTA_OUT_OF_RANGE", `row ${r} is outside 0 to ${this.info.nobs - 1}`, undefined, RangeError);
       }
     }
-    const spans: { start: number; count: number }[] = [];
+    // Runs of consecutive rows, read in one pass.
+    const ranges: [number, number][] = [];
+    const where = new Map<number, number>();
     for (const r of Float64Array.from(new Set(rows)).sort()) {
-      const last = spans[spans.length - 1];
-      if (last && r - (last.start + last.count) < 64) last.count = r - last.start + 1;
-      else spans.push({ start: r, count: 1 });
+      const last = ranges[ranges.length - 1];
+      if (last && r === last[0] + last[1]) last[1]++;
+      else ranges.push([r, 1]);
+      where.set(r, where.size);
     }
-    const where = new Map<number, [TableColumn[], number]>();
-    for (const s of spans) {
-      const cols = this.gather(idx, s.start, s.count);
-      for (let i = 0; i < s.count; i++) where.set(s.start + i, [cols, i]);
-    }
+    const cols = this.gather(idx, ranges);
     return rows.map((r) => {
-      const [cols, i] = where.get(r)!;
+      const i = where.get(r)!;
       return cols.map((c) => cellOf(c, i));
     });
   }
 
-  /** Rows `start` to `start + count` of the variables at `idx`, read in calls of at most `STEP` rows. */
-  private gather(idx: number[], start: number, count: number): TableColumn[] {
+  /**
+   * The rows of `ranges` ([start, count], ascending and apart) of the
+   * variables at `idx`, end to end, read in calls of at most `STEP` rows.
+   */
+  private gather(idx: number[], ranges: [number, number][]): TableColumn[] {
+    const count = ranges.reduce((n, r) => n + r[1], 0);
     const core = this.open;
     const distinct = [...new Set(idx)].sort((a, b) => a - b);
     const vars = distinct.map((k) => this.variables[k]);
@@ -727,13 +735,13 @@ export class ParquetReader implements TableReader {
     }
     // Codecs the module does not read are named before any read.
     const groups = this.info.rowGroups;
-    for (const [j, k] of distinct.entries()) {
+    const unread = this.info.compression.some((c) => !CODECS.has(c));
+    for (const [j, k] of unread ? distinct.entries() : []) {
       for (let g = 0; g < groups.length && count > 0; g++) {
         const { firstRow, rows } = groups[g];
         const codec = vars[j].chunks[g]?.codec;
-        if (firstRow < start + count && firstRow + rows > start && codec && !CODECS.has(codec)) {
-          const what = codec === "lz4" ? "the Hadoop framing of LZ4 (LZ4_RAW is read)" : `${codec} compression`;
-          throw dtaError("DTA_INVALID", `column ${JSON.stringify(this.variables[k].name)}: ${what} is not supported by pqparser`, undefined, TypeError);
+        if (codec && !CODECS.has(codec) && ranges.some(([start, n]) => n > 0 && firstRow < start + n && firstRow + rows > start)) {
+          throw dtaError("DTA_INVALID", `column ${JSON.stringify(this.variables[k].name)}: ${codec} compression is not supported by pqparser`, undefined, TypeError);
         }
       }
     }
@@ -752,12 +760,20 @@ export class ParquetReader implements TableReader {
     const levels = vars.map((v) => new Map((v.categorical?.levels ?? []).map((l, i) => [l, i])));
     const fields = Uint32Array.from(distinct);
     const modes = Uint8Array.from(distinct, (k) => this.modes[k]);
-    for (const [at, n] of this.calls(start, count)) {
-      core.with([new Uint8Array(fields.buffer), modes], ([f, m]) => {
+    // The file row of output row `i`, for messages.
+    const rowOf = (i: number): number => {
+      for (const [start, n] of ranges) {
+        if (i < n) return start + i;
+        i -= n;
+      }
+      return -1;
+    };
+    for (const { at, n, ranges: part } of this.calls(ranges)) {
+      core.with([new Uint8Array(fields.buffer), modes, new Uint8Array(Float64Array.from(part).buffer)], ([f, m, r]) => {
         try {
-          core.call((x) => x.pq_read(f, m, distinct.length, start + at, n));
+          core.call((x) => x.pq_read(f, m, distinct.length, r, part.length / 2));
           const dir = core.typed(Uint32Array, core.call((x) => x.pq_directory()), 11 * distinct.length).slice();
-          vars.forEach((v, j) => place(core, out[j], dir.subarray(11 * j, 11 * j + 11), at, n, v, levels[j], start));
+          vars.forEach((v, j) => place(core, out[j], dir.subarray(11 * j, 11 * j + 11), at, n, v, levels[j], rowOf));
         } finally {
           core.readEnd();
         }
@@ -776,16 +792,39 @@ export class ParquetReader implements TableReader {
   }
 
   /**
-   * The module calls a read of rows `start` to `start + count` makes, as
-   * [first row from `start`, rows]: whole row groups together up to `STEP`
-   * rows, a larger one in parts, so that each call holds at most `STEP` rows
-   * and a page is rarely decoded twice.
+   * The module calls a read of `ranges` makes: each with where its rows go
+   * in the output (`at`, `n`) and the ranges it reads, as start, count,
+   * start, count..., at most `STEP` rows a call.
    */
-  private calls(start: number, count: number): [number, number][] {
+  private calls(ranges: [number, number][]): { at: number; n: number; ranges: number[] }[] {
+    const out: { at: number; n: number; ranges: number[] }[] = [];
+    let at = 0;
+    for (const [start, count] of ranges) {
+      for (const [from, take] of this.pieces(start, count)) {
+        const last = out[out.length - 1];
+        if (last && last.n + take <= STEP) {
+          last.ranges.push(start + from, take);
+          last.n += take;
+        } else out.push({ at, n: take, ranges: [start + from, take] });
+        at += take;
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Rows `start` to `start + count` in pieces, as [first row from `start`,
+   * rows]: whole row groups together up to `STEP` rows, a larger one in
+   * parts, so that each holds at most `STEP` rows and a page is rarely
+   * decoded twice.
+   */
+  private pieces(start: number, count: number): [number, number][] {
     const out: [number, number][] = [];
     const end = start + count;
     let at = start;
-    for (const g of this.info.rowGroups) {
+    const groups = this.info.rowGroups;
+    for (let k = this.groupOf(start); k < groups.length; k++) {
+      const g = groups[k];
       const groupEnd = Math.min(end, g.firstRow + g.rows);
       if (groupEnd <= at) continue;
       while (at < groupEnd) {
@@ -798,6 +837,18 @@ export class ParquetReader implements TableReader {
       if (at >= end) break;
     }
     return out;
+  }
+
+  /** The first row group that ends after row `row` (binary search). */
+  private groupOf(row: number): number {
+    const groups = this.info.rowGroups;
+    let [lo, hi] = [0, groups.length];
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (groups[mid].firstRow + groups[mid].rows <= row) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
   }
 
   /** Release the file (and close it, if `openParquetFile` opened it by path). Further reads throw. */
@@ -822,7 +873,7 @@ const CODED = 4;
 const NULL = 0xffffffff;
 
 /** Copy one call's column `d` (src/lib.rs's directory) into `col` from row `at`. */
-function place(core: Core, col: TableColumn, d: Uint32Array, at: number, n: number, v: ParquetVariable, levels: Map<string, number>, start: number): void {
+function place(core: Core, col: TableColumn, d: Uint32Array, at: number, n: number, v: ParquetVariable, levels: Map<string, number>, rowOf: (i: number) => number): void {
   if (col.kind === "number") {
     col.values.set(core.typed(Float64Array, d[1], d[2]), at);
     col.missing.set(core.view(d[3], d[4]), at);
@@ -881,7 +932,7 @@ function place(core: Core, col: TableColumn, d: Uint32Array, at: number, n: numb
       let k = levels.get(entries[e]);
       if (k === undefined) {
         if (fixed) {
-          throw dtaError("DTA_INVALID", `column ${JSON.stringify(v.name)}: the value ${JSON.stringify(entries[e])} in row ${start + at + i + 1} is not one of the levels in the dta profile`, undefined, TypeError);
+          throw dtaError("DTA_INVALID", `column ${JSON.stringify(v.name)}: the value ${JSON.stringify(entries[e])} in row ${rowOf(at + i) + 1} is not one of the levels in the dta profile`, undefined, TypeError);
         }
         k = col.values.length;
         col.values.push(entries[e]);

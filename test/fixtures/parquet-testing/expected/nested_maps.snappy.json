@@ -1,0 +1,1 @@
+{"rows":6,"columns":[{"name":"b","arrow_type":"int32","values":[1,1,1,1,1,1]},{"name":"c","arrow_type":"double","values":[1.0,1.0,1.0,1.0,1.0,1.0]}],"nested":["a"]}

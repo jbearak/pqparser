@@ -14,3 +14,10 @@ credit the projects that wrote and read them:
 The scripts and paths those READMEs name are in the dta-parser
 repository, not here. No file here comes from Stata or from any
 dataset; every value was made by those scripts.
+
+`odd/` holds small files whose footers arrow-rs refuses and other readers
+take, made by `scripts/make_odd.py` (pyarrow, then bytes of the footer
+changed) and, for `null_text_and_wide_decimal.parquet`, by arrow-rs's
+`SerializedFileWriter` (see `test/api.test.mjs`). `parquet-testing/` is
+Apache's corpus (see its README). `not_utf8.parquet` and
+`null_column.parquet` are described in the tests that read them.

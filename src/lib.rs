@@ -21,7 +21,7 @@ use bytes::Bytes;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions, ParquetRecordBatchReaderBuilder, RowSelection, RowSelector};
 use parquet::arrow::ProjectionMask;
 use parquet::basic::{Compression, LogicalType, TimeUnit};
-use parquet::file::metadata::{PageIndexPolicy, ParquetMetaData, ParquetMetaDataReader};
+use parquet::file::metadata::{FileMetaData, PageIndexPolicy, ParquetMetaData, ParquetMetaDataBuilder, ParquetMetaDataReader};
 use parquet::file::reader::{ChunkReader, Length};
 use parquet::file::statistics::Statistics;
 
@@ -108,7 +108,15 @@ enum Out {
 struct State {
     file: Host,
     meta: Arc<ParquetMetaData>,
+    /// The footer as decoded, when it had to be mended; else read again when needed.
+    footer: Option<Vec<u8>>,
+    /// Columns whose annotation did not fit their physical type, and why: the annotation was dropped.
+    ignored: Vec<(String, String)>,
     arrow: Option<ArrowReaderMetadata>,
+    /// Whether text is read as bytes (and mended) because some was not UTF-8.
+    lossy: bool,
+    /// How arrow-rs reads INT96 columns in seconds, to find values that nanoseconds do not hold.
+    seconds: Option<ArrowReaderMetadata>,
     outs: Vec<Out>,
     directory: Vec<u32>,
 }
@@ -180,9 +188,19 @@ pub extern "C" fn pq_open(len: f64) -> f64 {
     }));
     let file = Host { len: len as u64 };
     match load(&file) {
-        Ok(meta) => {
+        Ok(Loaded { meta, footer, ignored }) => {
             STATE.with(|s| {
-                *s.borrow_mut() = Some(State { file, meta: Arc::new(meta), arrow: None, outs: Vec::new(), directory: Vec::new() })
+                *s.borrow_mut() = Some(State {
+                    file,
+                    meta: Arc::new(meta),
+                    footer,
+                    ignored,
+                    arrow: None,
+                    lossy: false,
+                    seconds: None,
+                    outs: Vec::new(),
+                    directory: Vec::new(),
+                })
             });
             0.0
         }
@@ -193,31 +211,142 @@ pub extern "C" fn pq_open(len: f64) -> f64 {
     }
 }
 
-/// The footer, and the offset indexes when there are any.
-fn load(file: &Host) -> Result<ParquetMetaData, String> {
-    let reader =
-        |r: ParquetMetaDataReader| r.with_column_index_policy(PageIndexPolicy::Skip).with_offset_index_policy(PageIndexPolicy::Optional);
-    let e = match reader(ParquetMetaDataReader::new()).parse_and_finish(file) {
-        Ok(meta) => return Ok(meta),
-        Err(e) => e.to_string(),
-    };
-    // Parquet2.jl gives a DECIMAL's precision and scale in its logical
-    // type alone, which arrow-rs refuses: they are added and the footer
-    // read again.
-    if !e.contains("DECIMAL logical type") || file.len < 12 {
-        return Err(e);
-    }
-    let tail = file.get_bytes(file.len - 8, 8).map_err(|e| e.to_string())?;
-    let n = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as u64;
-    let footer = file.get_bytes(file.len.saturating_sub(8 + n), n as usize).map_err(|e| e.to_string())?;
-    let fixed = decimal_fields(&footer).ok_or(e)?;
-    let meta = ParquetMetaDataReader::decode_metadata(&fixed).map_err(|e| e.to_string())?;
-    let mut r = reader(ParquetMetaDataReader::new_with_metadata(meta));
-    r.read_page_indexes(file).map_err(|e| e.to_string())?;
-    r.finish().map_err(|e| e.to_string())
+struct Loaded {
+    meta: ParquetMetaData,
+    footer: Option<Vec<u8>>,
+    ignored: Vec<(String, String)>,
 }
 
-/// Thrift's compact protocol, as far as `decimal_fields` needs it.
+fn with_indexes(r: ParquetMetaDataReader) -> ParquetMetaDataReader {
+    r.with_column_index_policy(PageIndexPolicy::Skip).with_offset_index_policy(PageIndexPolicy::Optional)
+}
+
+/// The file's footer as bytes.
+fn footer_bytes(file: &Host) -> Result<Vec<u8>, String> {
+    if file.len < 12 {
+        return Err("the file is too short to be Parquet".into());
+    }
+    let tail = file.get_bytes(file.len - 8, 8).map_err(|e| e.to_string())?;
+    if tail[4..] != *b"PAR1" {
+        return Err("the file does not end in PAR1, so it is not Parquet (or is encrypted)".into());
+    }
+    let n = u32::from_le_bytes([tail[0], tail[1], tail[2], tail[3]]) as u64;
+    if n + 8 > file.len {
+        return Err("the footer's length runs past the start of the file".into());
+    }
+    Ok(file.get_bytes(file.len - 8 - n, n as usize).map_err(|e| e.to_string())?.to_vec())
+}
+
+/// The footer, and the offset indexes when there are any and they read.
+fn load(file: &Host) -> Result<Loaded, String> {
+    let e = match with_indexes(ParquetMetaDataReader::new()).parse_and_finish(file) {
+        Ok(meta) if !zero_dictionary_offset(&meta) && !unknown_logical(&meta) => {
+            return Ok(Loaded { meta: true_rows(meta), footer: None, ignored: Vec::new() })
+        }
+        Ok(_) => None,
+        Err(e) => Some(e.to_string()),
+    };
+    let mut footer = footer_bytes(file).map_err(|f| e.clone().unwrap_or(f))?;
+    // arrow-rs refuses some footers other readers take; each is mended and
+    // the footer read again.
+    let mut ignored = Vec::new();
+    let mut tries = 0;
+    let mut meta = loop {
+        let e = match ParquetMetaDataReader::decode_metadata(&footer) {
+            Ok(meta) => break meta,
+            Err(e) => e.to_string(),
+        };
+        tries += 1;
+        let mended = if tries > 64 {
+            None
+        } else if e.contains("DECIMAL logical type") {
+            // Parquet2.jl gives a DECIMAL's precision and scale in its
+            // logical type alone: they are added.
+            decimal_fields(&footer)
+        } else if let Some(name) = misfit(&e) {
+            // An annotation that does not fit the physical type (UUID on an
+            // INT32, TIMESTAMP on a FIXED_LEN_BYTE_ARRAY): the column is read
+            // as its physical type, as parquet-testing's README asks. Only
+            // the elements of that name whose annotation was refused.
+            let mended = drop_misfits(&footer, name, &e);
+            if mended.is_some() {
+                ignored.push((name.to_string(), e.trim_start_matches("Parquet error: ").to_string()));
+            }
+            mended
+        } else {
+            // A column chunk's field of the wrong type (Dremio writes a list
+            // where Parquet has bloom_filter_length): it is left out.
+            drop_misfit_fields(&footer)
+        };
+        footer = mended.ok_or(e)?;
+    };
+    // An offset index only spares a read some pages: one that does not read
+    // (or is damaged) is left out.
+    if zero_dictionary_offset(&meta) {
+        footer = drop_misfit_fields(&footer).ok_or("a column chunk's dictionary page is at byte 0")?;
+        meta = ParquetMetaDataReader::decode_metadata(&footer).map_err(|e| e.to_string())?;
+    }
+    if unknown_logical(&meta) {
+        // A logical type newer than arrow-rs: arrow-rs reads the footer but
+        // cannot read the column, or (for an integer) any column. Parquet
+        // asks readers to ignore it, so the column is read as its physical type.
+        footer = drop_unknown_logical(&footer).ok_or("the footer could not be mended")?;
+        meta = ParquetMetaDataReader::decode_metadata(&footer).map_err(|e| e.to_string())?;
+    }
+    let mut r = with_indexes(ParquetMetaDataReader::new_with_metadata(meta.clone()));
+    let meta = match r.read_page_indexes(file).and_then(|_| r.finish()) {
+        Ok(m) => m,
+        Err(_) => meta,
+    };
+    Ok(Loaded { meta: true_rows(meta), footer: Some(footer), ignored })
+}
+
+/// The metadata with the file's rows the sum of its row groups' rows,
+/// where the footer says otherwise (parquet-rs 0.3 wrote 0): arrow-rs
+/// reads no more rows than the footer's count.
+fn true_rows(meta: ParquetMetaData) -> ParquetMetaData {
+    let rows: i64 = meta.row_groups().iter().map(|g| g.num_rows()).sum();
+    let fm = meta.file_metadata();
+    if fm.num_rows() == rows {
+        return meta;
+    }
+    let file = FileMetaData::new(
+        fm.version(),
+        rows,
+        fm.created_by().map(str::to_string),
+        fm.key_value_metadata().cloned(),
+        fm.schema_descr_ptr(),
+        fm.column_orders().cloned(),
+    );
+    let mut b = ParquetMetaDataBuilder::from(meta);
+    let (groups, index) = (b.take_row_groups(), b.take_page_index());
+    ParquetMetaDataBuilder::new(file).set_row_groups(groups).set_page_index(index).build()
+}
+
+/// The field arrow-rs names when an annotation does not fit its physical type.
+fn misfit(e: &str) -> Option<&str> {
+    const FITS: [&str; 4] =
+        ["annotate", "is incompatible with converted type", "cannot be applied to a primitive type", "Cannot use millisecond unit"];
+    if !FITS.iter().any(|f| e.contains(f)) {
+        return None;
+    }
+    // "TYPE cannot annotate field 'NAME' because ...", where TYPE is one
+    // word; else "... for field 'NAME'" at the end, after text of arrow-rs's
+    // own that holds no " for field '".
+    let message = e.strip_prefix("Parquet error: ").unwrap_or(e);
+    if let Some(rest) = message.split_once(' ').and_then(|(_, rest)| rest.strip_prefix("cannot annotate field '")) {
+        return rest.get(..rest.rfind("' because")?);
+    }
+    let at = message.find(" for field '")? + " for field '".len();
+    message[at..].strip_suffix('\'')
+}
+
+/// Whether a column has a logical type newer than arrow-rs.
+fn unknown_logical(meta: &ParquetMetaData) -> bool {
+    meta.file_metadata().schema_descr().columns().iter().any(|c| matches!(c.logical_type_ref(), Some(LogicalType::_Unknown { .. })))
+}
+
+/// Thrift's compact protocol, as far as the footer's mending needs it.
 struct Thrift<'a> {
     b: &'a [u8],
     at: usize,
@@ -267,10 +396,13 @@ impl Thrift<'_> {
         }
         match ty {
             1 | 2 if in_field => {}
-            1..=3 => self.at += 1,
+            1..=3 => self.at = self.at.checked_add(1)?,
             4..=6 => drop(self.varint()?),
-            7 => self.at += 8,
-            8 => self.at += self.varint()? as usize,
+            7 => self.at = self.at.checked_add(8)?,
+            8 => {
+                let n = usize::try_from(self.varint()?).ok()?;
+                self.at = self.at.checked_add(n)?;
+            }
             9 | 10 => {
                 let x = self.byte()?;
                 let n = if x >> 4 == 15 { self.varint()? } else { u64::from(x >> 4) };
@@ -300,9 +432,23 @@ impl Thrift<'_> {
     }
 }
 
-/// The footer with each DECIMAL schema element given its precision (field
-/// 8) and scale (field 7) from its logical type where it lacks them.
-fn decimal_fields(footer: &[u8]) -> Option<Vec<u8>> {
+fn varint(out: &mut Vec<u8>, mut z: u64) {
+    while z >= 0x80 {
+        out.push(z as u8 | 0x80);
+        z >>= 7;
+    }
+    out.push(z as u8);
+}
+
+fn zigzag(v: i32) -> u64 {
+    u64::from(((v << 1) ^ (v >> 31)) as u32)
+}
+
+/// A schema element's fields: id, type, and the value's bytes.
+type Fields = Vec<(i16, u8, Vec<u8>)>;
+
+/// The footer with each schema element's fields passed through `edit`.
+fn rewrite_schema(footer: &[u8], mut edit: impl FnMut(&mut Fields) -> Option<()>) -> Option<Vec<u8>> {
     let mut t = Thrift { b: footer, at: 0 };
     let mut last = 0;
     loop {
@@ -312,57 +458,243 @@ fn decimal_fields(footer: &[u8]) -> Option<Vec<u8>> {
             continue;
         }
         let x = t.byte()?;
+        if x & 0x0f != 12 {
+            return None;
+        }
         let n = if x >> 4 == 15 { t.varint()? } else { u64::from(x >> 4) };
         let mut out = footer[..t.at].to_vec();
         for _ in 0..n {
-            let start = t.at;
-            let (mut has, mut decimal, mut last) = ([false; 2], None, 0);
+            let mut fields = Fields::new();
+            let mut last = 0;
             while let Some((id, ty)) = t.field(&mut last)? {
-                match (id, ty) {
-                    (7 | 8, _) => has[id as usize - 7] = true,
-                    (10, 12) => {
-                        let mut last = 0;
-                        while let Some((id, ty)) = t.field(&mut last)? {
-                            if (id, ty) != (5, 12) {
-                                t.skip(ty, true, 1)?;
-                                continue;
-                            }
-                            let (mut scale, mut precision, mut last) = (0, 0, 0);
-                            while let Some((id, ty)) = t.field(&mut last)? {
-                                match (id, ty) {
-                                    (1, 5) => scale = t.i32()?,
-                                    (2, 5) => precision = t.i32()?,
-                                    _ => t.skip(ty, true, 2)?,
-                                }
-                            }
-                            decimal = Some((scale, precision));
-                        }
-                        continue;
-                    }
-                    _ => {}
-                }
+                let from = t.at;
                 t.skip(ty, true, 1)?;
+                fields.push((id, ty, footer.get(from..t.at)?.to_vec()));
             }
-            out.extend_from_slice(&footer[start..t.at - 1]);
-            if let Some((scale, precision)) = decimal {
-                for (k, v) in [(7u8, scale), (8, precision)] {
-                    if !has[k as usize - 7] {
-                        // A field header in long form: its type, then its id.
-                        out.extend_from_slice(&[0x05, k << 1]);
-                        let mut z = ((v << 1) ^ (v >> 31)) as u32;
-                        while z >= 0x80 {
-                            out.push(z as u8 | 0x80);
-                            z >>= 7;
-                        }
-                        out.push(z as u8);
-                    }
-                }
+            edit(&mut fields)?;
+            // Each field header in long form (its type, then its id), so
+            // that fields can be dropped and added in any order.
+            for (id, ty, v) in fields {
+                out.push(ty);
+                varint(&mut out, zigzag(i32::from(id)));
+                out.extend_from_slice(&v);
             }
             out.push(0);
         }
-        out.extend_from_slice(&footer[t.at..]);
+        out.extend_from_slice(footer.get(t.at..)?);
         return Some(out);
     }
+}
+
+/// Whether a column chunk puts its dictionary page at byte 0, where the
+/// file's magic number is (Dremio's parquet-mr does): arrow-rs would read
+/// the chunk from there.
+fn zero_dictionary_offset(meta: &ParquetMetaData) -> bool {
+    meta.row_groups().iter().flat_map(|g| g.columns()).any(|c| c.dictionary_page_offset() == Some(0))
+}
+
+/// Each ColumnMetaData field's Thrift type, by its id.
+fn column_meta_type(id: i16) -> Option<u8> {
+    Some(match id {
+        1 | 4 | 15 => 5,
+        5..=7 | 9..=11 | 14 => 6,
+        2 | 3 | 8 | 13 => 9,
+        12 | 16 | 17 => 12,
+        _ => return None,
+    })
+}
+
+/// Copy the struct at `t` to `out`, each field header in long form,
+/// without the ColumnMetaData fields (at `path` 4, 1, 3: row groups,
+/// columns, meta_data) whose type is not Parquet's, or a
+/// dictionary_page_offset of 0 (the chunk's first page is then at
+/// data_page_offset, as for any chunk without the field); `dropped` counts them.
+fn copy_struct(t: &mut Thrift, out: &mut Vec<u8>, path: &mut Vec<i16>, dropped: &mut usize) -> Option<()> {
+    const TO_META: [i16; 3] = [4, 1, 3];
+    let mut last = 0;
+    while let Some((id, ty)) = t.field(&mut last)? {
+        let from = t.at;
+        if path[..] == TO_META {
+            let misfit = column_meta_type(id).is_some_and(|want| want != ty && !(want == 9 && ty == 10));
+            t.skip(ty, true, path.len())?;
+            let zero = (id, ty) == (11, 6) && t.b.get(from..t.at) == Some(&[0]);
+            if misfit || zero {
+                *dropped += 1;
+                continue;
+            }
+            t.at = from;
+        }
+        out.push(ty);
+        varint(out, zigzag(i32::from(id)));
+        let inward = path.len() < TO_META.len() && TO_META[path.len()] == id;
+        path.push(id);
+        match ty {
+            12 if inward => copy_struct(t, out, path, dropped)?,
+            9 | 10 if inward => {
+                let x = t.byte()?;
+                let n = if x >> 4 == 15 { t.varint()? } else { u64::from(x >> 4) };
+                out.extend_from_slice(t.b.get(from..t.at)?);
+                for _ in 0..n {
+                    if x & 0x0f == 12 {
+                        copy_struct(t, out, path, dropped)?;
+                    } else {
+                        let at = t.at;
+                        t.skip(x & 0x0f, false, path.len())?;
+                        out.extend_from_slice(t.b.get(at..t.at)?);
+                    }
+                }
+            }
+            _ => {
+                t.skip(ty, true, path.len())?;
+                out.extend_from_slice(t.b.get(from..t.at)?);
+            }
+        }
+        path.pop();
+    }
+    out.push(0);
+    Some(())
+}
+
+/// The footer without ColumnMetaData fields of the wrong type or a
+/// dictionary_page_offset of 0, if it had any.
+fn drop_misfit_fields(footer: &[u8]) -> Option<Vec<u8>> {
+    let (mut out, mut dropped) = (Vec::with_capacity(footer.len()), 0);
+    copy_struct(&mut Thrift { b: footer, at: 0 }, &mut out, &mut Vec::new(), &mut dropped)?;
+    (dropped > 0).then_some(out)
+}
+
+/// The first field of a logical type (a union): which type it is, and its bytes.
+fn logical_of(v: &[u8]) -> Option<(i16, &[u8])> {
+    let mut t = Thrift { b: v, at: 0 };
+    let (id, ty) = t.field(&mut 0)??;
+    let from = t.at;
+    t.skip(ty, true, 1)?;
+    Some((id, &v[from..t.at]))
+}
+
+/// The footer with each DECIMAL schema element given its precision (field
+/// 8) and scale (field 7) from its logical type where it lacks them.
+fn decimal_fields(footer: &[u8]) -> Option<Vec<u8>> {
+    let mut added = false;
+    let out = rewrite_schema(footer, |fields| {
+        let Some((5, d)) = fields.iter().find(|f| (f.0, f.1) == (10, 12)).and_then(|f| logical_of(&f.2)) else {
+            return Some(());
+        };
+        let mut t = Thrift { b: d, at: 0 };
+        let (mut scale, mut precision, mut last) = (0, 0, 0);
+        while let Some((id, ty)) = t.field(&mut last)? {
+            match (id, ty) {
+                (1, 5) => scale = t.i32()?,
+                (2, 5) => precision = t.i32()?,
+                _ => t.skip(ty, true, 2)?,
+            }
+        }
+        for (k, v) in [(7, scale), (8, precision)] {
+            if !fields.iter().any(|f| f.0 == k) {
+                let mut b = Vec::new();
+                varint(&mut b, zigzag(v));
+                fields.push((k, 5, b));
+                added = true;
+            }
+        }
+        Some(())
+    })?;
+    added.then_some(out)
+}
+
+/// A schema element's name (field 4).
+fn name_of(fields: &Fields) -> Option<&[u8]> {
+    let (_, _, v) = fields.iter().find(|f| (f.0, f.1) == (4, 8))?;
+    let mut t = Thrift { b: v, at: 0 };
+    let n = t.varint()? as usize;
+    v.get(t.at..t.at + n)
+}
+
+/// The footer without the annotation (logical and converted types) of the
+/// elements named `name` that have one whose place among them (from 0) is
+/// in `which` (ascending), and how many such elements there are.
+fn drop_annotation(footer: &[u8], name: &str, which: &[usize]) -> Option<(Vec<u8>, usize)> {
+    let mut seen = 0;
+    let out = rewrite_schema(footer, |fields| {
+        if name_of(fields) == Some(name.as_bytes()) && fields.iter().any(|f| f.0 == 6 || f.0 == 10) {
+            if which.binary_search(&seen).is_ok() {
+                fields.retain(|f| f.0 != 6 && f.0 != 10);
+            }
+            seen += 1;
+        }
+        Some(())
+    })?;
+    Some((out, seen))
+}
+
+/// The footer without the annotations arrow-rs refused (error `e`) on
+/// elements named `name`, keeping those of the same name it takes.
+/// arrow-rs names only the first element it refuses, and several may give
+/// the same error. A binary search finds a `k` where dropping the first
+/// `k` elements' annotations changes the error and dropping the first
+/// `k - 1` does not (not always the smallest such `k`: dropping one refused
+/// element can bring out another's different error). If dropping the
+/// `k`th alone changes the error, that is all; else each of the others is
+/// put back unless that brings the error back. The caller reads the footer
+/// again and mends whatever error is left.
+fn drop_misfits(footer: &[u8], name: &str, e: &str) -> Option<Vec<u8>> {
+    let fixed = |which: &[usize]| {
+        let (f, _) = drop_annotation(footer, name, which)?;
+        match ParquetMetaDataReader::decode_metadata(&f) {
+            Ok(_) => Some(f),
+            Err(again) => (again.to_string() != e).then_some(f),
+        }
+    };
+    let first = |k: usize| (0..k).collect::<Vec<usize>>();
+    let (_, n) = drop_annotation(footer, name, &[])?;
+    fixed(&first(n))?;
+    // Dropping the first `lo` leaves the error; dropping the first `hi` changes it.
+    let (mut lo, mut hi) = (0, n);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if fixed(&first(mid)).is_some() {
+            hi = mid;
+        } else {
+            lo = mid;
+        }
+    }
+    if let Some(f) = fixed(&[hi - 1]) {
+        return Some(f);
+    }
+    let mut which = first(hi);
+    for j in (0..hi - 1).rev() {
+        let fewer: Vec<usize> = which.iter().copied().filter(|&x| x != j).collect();
+        if fixed(&fewer).is_some() {
+            which = fewer;
+        }
+    }
+    fixed(&which)
+}
+
+/// The footer without logical types arrow-rs does not know (Parquet's
+/// union ids 1 to 8 and 10 to 18 are the ones it knows).
+fn drop_unknown_logical(footer: &[u8]) -> Option<Vec<u8>> {
+    rewrite_schema(footer, |fields| {
+        fields.retain(|(id, ty, v)| (*id, *ty) != (10, 12) || logical_of(v).is_some_and(|(k, _)| matches!(k, 1..=8 | 10..=18)));
+        Some(())
+    })
+}
+
+/// The footer without the text annotations (STRING, ENUM and JSON, as
+/// logical or converted types), so that arrow-rs reads text as bytes.
+/// With `all` false, only JSON's.
+fn drop_text(footer: &[u8], all: bool) -> Option<Vec<u8>> {
+    rewrite_schema(footer, |fields| {
+        let text = fields.iter().any(|(id, ty, v)| match (id, ty) {
+            (10, 12) => logical_of(v).is_some_and(|(k, _)| k == 12 || (all && matches!(k, 1 | 4))),
+            (6, 5) => Thrift { b: v, at: 0 }.i32().is_some_and(|c| c == 19 || (all && matches!(c, 0 | 4))),
+            _ => false,
+        });
+        if text {
+            fields.retain(|f| f.0 != 6 && f.0 != 10);
+        }
+        Some(())
+    })
 }
 
 // ---------------------------------------------------------------- JSON
@@ -548,6 +880,17 @@ pub extern "C" fn pq_meta() -> f64 {
                 arrow = kv.value.as_deref();
             }
         }
+        o.push_str("],\"ignored\":[");
+        for (k, (name, why)) in state.ignored.iter().enumerate() {
+            if k > 0 {
+                o.push(',');
+            }
+            o.push('[');
+            string(&mut o, name);
+            o.push(',');
+            string(&mut o, why);
+            o.push(']');
+        }
         o.push_str("],\"arrow\":");
         match arrow {
             Some(text) => arrow_fields(&mut o, text),
@@ -671,8 +1014,9 @@ fn tagged(v: f64) -> u8 {
 
 struct Column<'a> {
     name: &'a str,
-    /// The file row of the column's next value, for messages.
-    row: u64,
+    /// The rows read, and how many of them came before this batch, for messages.
+    ranges: &'a [(u64, u64)],
+    at: usize,
 }
 
 impl Column<'_> {
@@ -680,9 +1024,20 @@ impl Column<'_> {
         Fail(-2.0, format!(
             "column \"{}\": the value {v} in row {} is beyond the safe integers a JavaScript number holds exactly; read with int64: \"bigint\" to keep every digit",
             self.name,
-            self.row + i as u64
+            file_row(self.ranges, self.at + i)
         ))
     }
+}
+
+/// The file row (from 0) of value `i` of a read of `ranges`.
+fn file_row(ranges: &[(u64, u64)], mut i: usize) -> u64 {
+    for &(start, count) in ranges {
+        if (i as u64) < count {
+            return start + i as u64;
+        }
+        i -= count as usize;
+    }
+    0
 }
 
 /// Numbers and missing codes: 1 (and NaN) for a null.
@@ -748,6 +1103,7 @@ fn add_numbers(a: &dyn Array, values: &mut Vec<f64>, codes: &mut Vec<u8>, col: &
             }
         }
         DataType::Float32 => numbers::<Float32Type>(a, values, codes, f64::from),
+        DataType::Float16 => numbers::<Float16Type>(a, values, codes, |v| v.to_f64()),
         // A column of nulls only (pyarrow's `null` type): every row is `.`.
         DataType::Null => {
             values.resize(values.len() + a.len(), f64::NAN);
@@ -772,6 +1128,8 @@ fn add_numbers(a: &dyn Array, values: &mut Vec<f64>, codes: &mut Vec<u8>, col: &
         DataType::Decimal32(_, s) => numbers::<Decimal32Type>(a, values, codes, |v| v as f64 / pow10(*s)),
         DataType::Decimal64(_, s) => numbers::<Decimal64Type>(a, values, codes, |v| v as f64 / pow10(*s)),
         DataType::Decimal128(_, s) => numbers::<Decimal128Type>(a, values, codes, |v| v as f64 / pow10(*s)),
+        // Up to 15 digits in more than 16 bytes, which arrow-rs reads as 256 bits.
+        DataType::Decimal256(_, s) => numbers::<Decimal256Type>(a, values, codes, |v| v.as_i128() as f64 / pow10(*s)),
         DataType::Int64 => safe_numbers::<Int64Type>(a, values, codes, col, i128::from)?,
         DataType::UInt64 => safe_numbers::<UInt64Type>(a, values, codes, col, i128::from)?,
         DataType::Time64(ArrowUnit::Microsecond) => safe_numbers::<Time64MicrosecondType>(a, values, codes, col, i128::from)?,
@@ -811,14 +1169,21 @@ fn add_bytes(
     ends: &mut Vec<u32>,
     missing: &mut Vec<u8>,
     codes: &mut Option<Vec<u32>>,
+    text: bool,
     col: &Column,
 ) -> Result<(), Fail> {
+    // Text: each value not UTF-8 (read as bytes: see `State::lossy` and
+    // `arrow_meta`) is mended, its bad bytes each replaced by U+FFFD.
+    let put = |bytes: &mut Vec<u8>, v: &[u8]| match text.then(|| String::from_utf8_lossy(v)) {
+        Some(std::borrow::Cow::Owned(s)) => bytes.extend_from_slice(s.as_bytes()),
+        _ => bytes.extend_from_slice(v),
+    };
     if let Some(d) = a.as_dictionary_opt::<Int32Type>() {
         // Each value the rows use once, however often they use it.
         let values = d.values().as_ref();
         let value = |k: usize| -> Result<&[u8], Fail> {
             Ok(match values.data_type() {
-                DataType::Utf8 => values.as_string::<i32>().value(k).as_bytes(),
+                DataType::Utf8 => utf8_bytes(values.as_string::<i32>(), k),
                 DataType::Binary => values.as_binary::<i32>().value(k),
                 t => return Err(Fail(-2.0, format!("column \"{}\": a dictionary of {t} is not read as text", col.name))),
             })
@@ -832,7 +1197,7 @@ fn add_bytes(
                     let k = k as usize;
                     if remap[k] == u32::MAX {
                         remap[k] = ends.len() as u32;
-                        bytes.extend_from_slice(value(k)?);
+                        put(bytes, value(k)?);
                         ends.push(bytes.len() as u32);
                     }
                     remap[k]
@@ -843,25 +1208,57 @@ fn add_bytes(
     }
     let mut push = |v: Option<&[u8]>| {
         if let Some(v) = v {
-            bytes.extend_from_slice(v);
+            put(bytes, v);
         }
         missing.push(v.is_none() as u8);
         ends.push(bytes.len() as u32);
     };
     match a.data_type() {
-        DataType::Utf8 => a.as_string::<i32>().iter().for_each(|v| push(v.map(str::as_bytes))),
-        DataType::LargeUtf8 => a.as_string::<i64>().iter().for_each(|v| push(v.map(str::as_bytes))),
+        DataType::Utf8 => {
+            let s = a.as_string::<i32>();
+            (0..s.len()).for_each(|i| push((!s.is_null(i)).then(|| utf8_bytes(s, i))))
+        }
+        DataType::LargeUtf8 => {
+            let s = a.as_string::<i64>();
+            (0..s.len()).for_each(|i| push((!s.is_null(i)).then(|| utf8_bytes(s, i))))
+        }
+        // A column of nulls only (Parquet's UNKNOWN): every row is null.
+        DataType::Null => (0..a.len()).for_each(|_| push(None)),
         DataType::Utf8View => a.as_string_view().iter().for_each(|v| push(v.map(str::as_bytes))),
         DataType::Binary => a.as_binary::<i32>().iter().for_each(&mut push),
         DataType::LargeBinary => a.as_binary::<i64>().iter().for_each(&mut push),
         DataType::BinaryView => a.as_binary_view().iter().for_each(&mut push),
         DataType::FixedSizeBinary(_) => a.as_fixed_size_binary().iter().for_each(&mut push),
+        // A DECIMAL with more digits than a double holds: every digit, as text.
+        DataType::Decimal32(..) => decimals::<Decimal32Type>(a, &mut push),
+        DataType::Decimal64(..) => decimals::<Decimal64Type>(a, &mut push),
+        DataType::Decimal128(..) => decimals::<Decimal128Type>(a, &mut push),
+        DataType::Decimal256(..) => decimals::<Decimal256Type>(a, &mut push),
         t => return Err(Fail(-2.0, format!("column \"{}\": {t} is not read as text", col.name))),
     }
     if bytes.len() > u32::MAX as usize {
         return Err(Fail(-2.0, format!("column \"{}\": the text read is more than 4 GiB", col.name)));
     }
     Ok(())
+}
+
+/// Value `i`'s bytes, not taken as a `str`: arrow-rs does not check that
+/// a JSON column is UTF-8.
+fn utf8_bytes<O: arrow_array::OffsetSizeTrait>(s: &arrow_array::GenericStringArray<O>, i: usize) -> &[u8] {
+    let o = s.value_offsets();
+    &s.values()[o[i].as_usize()..o[i + 1].as_usize()]
+}
+
+/// Each decimal as text, with every digit (arrow-rs's `value_as_string`).
+fn decimals<T: DecimalType>(a: &dyn Array, push: &mut impl FnMut(Option<&[u8]>)) {
+    let a = a.as_primitive::<T>();
+    for i in 0..a.len() {
+        if a.is_null(i) {
+            push(None);
+        } else {
+            push(Some(a.value_as_string(i).as_bytes()));
+        }
+    }
 }
 
 /// Text's end offsets in UTF-16 units; `None` when they are its byte offsets (ASCII).
@@ -879,107 +1276,244 @@ fn utf16_ends(bytes: &[u8], ends: &[u32]) -> Option<Vec<u32>> {
     Some(out)
 }
 
-/// The rows to select from each row group that overlaps rows `start` to `start + count`.
-fn selection(meta: &ParquetMetaData, start: u64, count: u64) -> (Vec<usize>, Vec<RowSelector>) {
+/// The row groups that hold any of `ranges` ([start, count], ascending and
+/// apart), and the rows to select from each.
+fn selection(meta: &ParquetMetaData, ranges: &[(u64, u64)]) -> (Vec<usize>, Vec<RowSelector>) {
     let (mut groups, mut select) = (Vec::new(), Vec::new());
-    let end = start + count;
     let mut first = 0u64;
+    // The first range that may reach the current row group.
+    let mut next = 0;
     for (g, rg) in meta.row_groups().iter().enumerate() {
         let n = rg.num_rows().max(0) as u64;
         let (a, b) = (first, first + n);
         first = b;
-        if b <= start || a >= end || n == 0 {
-            continue;
+        while next < ranges.len() && ranges[next].0 + ranges[next].1 <= a {
+            next += 1;
         }
-        let (s, e) = (start.max(a) - a, end.min(b) - a);
-        groups.push(g);
-        if s > 0 {
-            select.push(RowSelector::skip(s as usize));
+        if next == ranges.len() {
+            break;
         }
-        select.push(RowSelector::select((e - s) as usize));
-        if e < n {
-            select.push(RowSelector::skip((n - e) as usize));
+        let mut at = a;
+        for &(start, count) in &ranges[next..] {
+            if start >= b {
+                break;
+            }
+            let (s, e) = (start.max(a), (start + count).min(b));
+            if s >= e {
+                continue;
+            }
+            if at == a {
+                groups.push(g);
+            }
+            if s > at {
+                select.push(RowSelector::skip((s - at) as usize));
+            }
+            select.push(RowSelector::select((e - s) as usize));
+            at = e;
+        }
+        if at > a && at < b {
+            select.push(RowSelector::skip((b - at) as usize));
         }
     }
     (groups, select)
 }
 
-/// Read rows `start` to `start + count` of the `n` top-level fields at
-/// `fields` (ascending, each once), each as `modes` says; then
-/// `pq_directory` says where each one's buffers are. Returns 0, or -1 with
-/// the error's message as the result.
+/// How arrow-rs is to read the file: the Parquet types alone
+/// (ARROW:schema could change units), with text stored as a dictionary in
+/// every row group read as one, so that each distinct value is copied out
+/// once; when `state.lossy`, text is read as bytes. JSON is always read as
+/// bytes: arrow-rs does not check that it is UTF-8, so a Utf8 array of it
+/// could hold bytes that are not.
+fn arrow_meta(state: &State) -> Result<ArrowReaderMetadata, String> {
+    let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
+    let plain = ArrowReaderMetadata::try_new(state.meta.clone(), options.clone()).map_err(|e| e.to_string())?;
+    let roots = state.meta.file_metadata().schema_descr().root_schema().get_fields();
+    let json = |k: usize| {
+        let info = roots[k].get_basic_info();
+        roots[k].is_primitive()
+            && (matches!(info.logical_type_ref(), Some(LogicalType::Json)) || info.converted_type() == parquet::basic::ConvertedType::JSON)
+    };
+    let any_json = (0..roots.len()).any(json);
+    let meta = if state.lossy || any_json {
+        let footer = match &state.footer {
+            Some(f) => f.clone(),
+            None => footer_bytes(&state.file)?,
+        };
+        let footer = drop_text(&footer, state.lossy).ok_or("the footer could not be read again")?;
+        let bare = ParquetMetaDataReader::decode_metadata(&footer).map_err(|e| e.to_string())?;
+        let index = ParquetMetaDataBuilder::from(state.meta.as_ref().clone()).take_page_index();
+        Arc::new(true_rows(ParquetMetaDataBuilder::from(bare).set_page_index(index).build()))
+    } else {
+        state.meta.clone()
+    };
+    let descr = state.meta.file_metadata().schema_descr();
+    let coded = |root: usize| {
+        let leaf = (0..descr.num_columns()).find(|&l| descr.get_column_root_idx(l) == root);
+        leaf.is_some_and(|l| state.meta.row_groups().iter().all(|g| g.column(l).dictionary_page_offset().is_some()))
+    };
+    let fields: Vec<_> = plain
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(k, f)| match f.data_type() {
+            DataType::Utf8 => {
+                let text = if state.lossy || json(k) { DataType::Binary } else { DataType::Utf8 };
+                let t = if coded(k) { DataType::Dictionary(Box::new(DataType::Int32), Box::new(text.clone())) } else { text };
+                Arc::new(f.as_ref().clone().with_data_type(t))
+            }
+            _ => f.clone(),
+        })
+        .collect();
+    let schema = Arc::new(arrow_schema::Schema::new(fields));
+    ArrowReaderMetadata::try_new(meta, options.with_schema(schema)).map_err(|e| e.to_string())
+}
+
+/// Read the rows of `ranges` ([start, count], ascending and apart) of the
+/// top-level `fields`, each as `modes` says, in one pass, so that a page is
+/// decompressed once however many of its rows are asked for.
+fn read(state: &mut State, fields: &[usize], modes: &[u8], ranges: &[(u64, u64)]) -> Result<Vec<Out>, Fail> {
+    let count: u64 = ranges.iter().map(|r| r.1).sum();
+    if state.arrow.is_none() {
+        state.arrow = Some(arrow_meta(state)?);
+    }
+    let arrow = state.arrow.clone().expect("set above");
+    let meta = state.meta.clone();
+    let schema = meta.file_metadata().schema_descr();
+    let names: Vec<&str> = fields.iter().map(|&f| schema.root_schema().get_fields()[f].name()).collect();
+    let mut outs: Vec<Out> = modes
+        .iter()
+        .map(|&m| match m {
+            NUMBER => Out::Number { values: Vec::with_capacity(count as usize), codes: Vec::with_capacity(count as usize) },
+            BIGINT => Out::BigInt { values: Vec::with_capacity(count as usize), codes: Vec::with_capacity(count as usize) },
+            _ => Out::Text { bytes: Vec::new(), ends: Vec::new(), missing: Vec::new(), utf16: None, codes: None },
+        })
+        .collect();
+    let (groups, select) = selection(&meta, ranges);
+    if !groups.is_empty() && count > 0 {
+        let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(state.file, arrow)
+            .with_projection(ProjectionMask::roots(schema, fields.iter().copied()))
+            .with_row_groups(groups)
+            .with_row_selection(RowSelection::from(select))
+            .with_batch_size(count.clamp(1, 1 << 16) as usize)
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut at = 0;
+        for batch in reader {
+            let batch = batch.map_err(|e| e.to_string())?;
+            for (k, out) in outs.iter_mut().enumerate() {
+                let a = batch.column(k).as_ref();
+                let col = Column { name: names[k], ranges, at };
+                match out {
+                    Out::Number { values, codes } => add_numbers(a, values, codes, &col)?,
+                    Out::BigInt { values, codes } => add_bigints(a, values, codes, &col)?,
+                    Out::Text { bytes, ends, missing, codes, .. } => add_bytes(a, bytes, ends, missing, codes, modes[k] == TEXT, &col)?,
+                }
+            }
+            at += batch.num_rows();
+        }
+        check_int96(state, fields, &names, &outs, ranges, count)?;
+    }
+    Ok(outs)
+}
+
+/// The top-level field `k`'s physical type, unless it is a group.
+fn physical(meta: &ParquetMetaData, k: usize) -> Option<parquet::basic::Type> {
+    let field = &meta.file_metadata().schema_descr().root_schema().get_fields()[k];
+    field.is_primitive().then(|| field.get_physical_type())
+}
+
+/// An error for the first INT96 value read that nanoseconds since 1970 do
+/// not hold (before 1677 or after 2262, as Spark writes 9999-12-31):
+/// arrow-rs wraps those around. The INT96 columns are read again in
+/// seconds, which hold them, and compared.
+fn check_int96(state: &mut State, fields: &[usize], names: &[&str], outs: &[Out], ranges: &[(u64, u64)], count: u64) -> Result<(), Fail> {
+    let int96: Vec<usize> = (0..fields.len()).filter(|&k| physical(&state.meta, fields[k]) == Some(parquet::basic::Type::INT96)).collect();
+    if int96.is_empty() {
+        return Ok(());
+    }
+    if state.seconds.is_none() {
+        let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
+        let plain = ArrowReaderMetadata::try_new(state.meta.clone(), options.clone()).map_err(|e| e.to_string())?;
+        let schema: Vec<_> = plain
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(k, f)| match physical(&state.meta, k) {
+                Some(parquet::basic::Type::INT96) => {
+                    Arc::new(f.as_ref().clone().with_data_type(DataType::Timestamp(ArrowUnit::Second, None)))
+                }
+                _ => f.clone(),
+            })
+            .collect();
+        let schema = Arc::new(arrow_schema::Schema::new(schema));
+        state.seconds = Some(ArrowReaderMetadata::try_new(state.meta.clone(), options.with_schema(schema)).map_err(|e| e.to_string())?);
+    }
+    let seconds = state.seconds.clone().expect("set above");
+    let descr = state.meta.file_metadata().schema_descr();
+    let (groups, select) = selection(&state.meta, ranges);
+    let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(state.file, seconds)
+        .with_projection(ProjectionMask::roots(descr, int96.iter().map(|&k| fields[k])))
+        .with_row_groups(groups)
+        .with_row_selection(RowSelection::from(select))
+        .with_batch_size(count.clamp(1, 1 << 16) as usize)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut at = 0usize;
+    for batch in reader {
+        let batch = batch.map_err(|e| e.to_string())?;
+        for (j, &k) in int96.iter().enumerate() {
+            let s = batch.column(j).as_primitive::<TimestampSecondType>();
+            for i in 0..s.len() {
+                let ns = match &outs[k] {
+                    Out::BigInt { values, codes } if codes[at + i] == 0 => i128::from(values[at + i]),
+                    Out::Number { values, codes } if codes[at + i] == 0 => values[at + i] as i128,
+                    _ => continue,
+                };
+                if ns.div_euclid(1_000_000_000) != i128::from(s.value(i)) {
+                    return Err(Fail(-2.0, format!(
+                        "column \"{}\": the INT96 timestamp in row {} is {} seconds from 1970, more than nanoseconds since 1970 hold (the years 1677 to 2262)",
+                        names[k],
+                        file_row(ranges, at + i) + 1,
+                        s.value(i)
+                    )));
+                }
+            }
+        }
+        at += batch.num_rows();
+    }
+    Ok(())
+}
+
+/// Read the rows of `r` ranges, each a start and a count at `ranges`
+/// (ascending and apart), of the `n` top-level fields at `fields`
+/// (ascending, each once), each as `modes` says; then `pq_directory` says
+/// where each one's buffers are, the ranges' rows end to end. Returns 0, or
+/// -1 with the error's message as the result.
 ///
 /// # Safety
-/// `fields` and `modes` hold `n` values each.
+/// `fields` and `modes` hold `n` values each, `ranges` `2 * r` little-endian f64s.
 #[no_mangle]
-pub unsafe extern "C" fn pq_read(fields: *const u32, modes: *const u8, n: usize, start: f64, count: f64) -> f64 {
+pub unsafe extern "C" fn pq_read(fields: *const u32, modes: *const u8, n: usize, ranges: *const u8, r: usize) -> f64 {
     let fields: Vec<usize> = std::slice::from_raw_parts(fields, n).iter().map(|&f| f as usize).collect();
     let modes = std::slice::from_raw_parts(modes, n).to_vec();
+    // Little-endian f64s, read bytewise: the buffer need not be aligned.
+    let f = |b: &[u8]| f64::from_le_bytes(b.try_into().expect("8 bytes")) as u64;
+    let ranges: Vec<(u64, u64)> = std::slice::from_raw_parts(ranges, 16 * r).chunks(16).map(|p| (f(&p[..8]), f(&p[8..]))).collect();
     with_state(|state| {
         state.outs.clear();
         state.directory.clear();
-        if state.arrow.is_none() {
-            // The Parquet types alone (ARROW:schema could change units),
-            // with text stored as a dictionary in every row group read as
-            // one: each distinct value is then copied out once.
-            let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
-            let plain = ArrowReaderMetadata::try_new(state.meta.clone(), options.clone()).map_err(|e| e.to_string())?;
-            let descr = state.meta.file_metadata().schema_descr();
-            let coded = |root: usize| {
-                let leaf = (0..descr.num_columns()).find(|&l| descr.get_column_root_idx(l) == root);
-                leaf.is_some_and(|l| state.meta.row_groups().iter().all(|g| g.column(l).dictionary_page_offset().is_some()))
-            };
-            let fields: Vec<_> = plain
-                .schema()
-                .fields()
-                .iter()
-                .enumerate()
-                .map(|(k, f)| match f.data_type() {
-                    DataType::Utf8 if coded(k) => Arc::new(
-                        f.as_ref().clone().with_data_type(DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8))),
-                    ),
-                    _ => f.clone(),
-                })
-                .collect();
-            let schema = Arc::new(arrow_schema::Schema::new(fields));
-            state.arrow = Some(ArrowReaderMetadata::try_new(state.meta.clone(), options.with_schema(schema)).map_err(|e| e.to_string())?);
-        }
-        let arrow = state.arrow.clone().expect("set above");
-        let schema = state.meta.file_metadata().schema_descr();
-        let names: Vec<&str> = fields.iter().map(|&f| schema.root_schema().get_fields()[f].name()).collect();
-        let (start, count) = (start as u64, count as u64);
-        let mut outs: Vec<Out> = modes
-            .iter()
-            .map(|&m| match m {
-                NUMBER => Out::Number { values: Vec::with_capacity(count as usize), codes: Vec::with_capacity(count as usize) },
-                BIGINT => Out::BigInt { values: Vec::with_capacity(count as usize), codes: Vec::with_capacity(count as usize) },
-                _ => Out::Text { bytes: Vec::new(), ends: Vec::new(), missing: Vec::new(), utf16: None, codes: None },
-            })
-            .collect();
-        let (groups, select) = selection(&state.meta, start, count);
-        if !groups.is_empty() && count > 0 {
-            let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(state.file, arrow)
-                .with_projection(ProjectionMask::roots(schema, fields.iter().copied()))
-                .with_row_groups(groups)
-                .with_row_selection(RowSelection::from(select))
-                .with_batch_size(count.clamp(1, 1 << 16) as usize)
-                .build()
-                .map_err(|e| e.to_string())?;
-            let mut row = start;
-            for batch in reader {
-                let batch = batch.map_err(|e| e.to_string())?;
-                for (k, out) in outs.iter_mut().enumerate() {
-                    let a = batch.column(k).as_ref();
-                    let col = Column { name: names[k], row };
-                    match out {
-                        Out::Number { values, codes } => add_numbers(a, values, codes, &col)?,
-                        Out::BigInt { values, codes } => add_bigints(a, values, codes, &col)?,
-                        Out::Text { bytes, ends, missing, codes, .. } => add_bytes(a, bytes, ends, missing, codes, &col)?,
-                    }
-                }
-                row += batch.num_rows() as u64;
+        let mut outs = match read(state, &fields, &modes, &ranges) {
+            // Text that is not UTF-8: from now on, text is read as bytes and
+            // each value that is not UTF-8 mended.
+            Err(Fail(_, e)) if !state.lossy && e.contains("non UTF-8") => {
+                state.lossy = true;
+                state.arrow = None;
+                read(state, &fields, &modes, &ranges)?
             }
-        }
+            r => r?,
+        };
         // The directory: per column, its kind and five (pointer, length)
         // pairs; lengths count elements.
         let p = |v: *const u8| v as usize as u32;
@@ -1051,7 +1585,7 @@ mod tests {
     #[test]
     fn null_columns_are_missing() {
         let a = NullArray::new(3);
-        let col = Column { name: "x", row: 0 };
+        let col = Column { name: "x", ranges: &[(0, 3)], at: 0 };
         let (mut values, mut codes) = (vec![1.0], vec![0]);
         assert!(add_numbers(&a, &mut values, &mut codes, &col).is_ok());
         assert_eq!(codes, [0, 1, 1, 1]);

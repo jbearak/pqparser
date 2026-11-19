@@ -29,11 +29,6 @@ export function fixtures() {
   return out;
 }
 
-/** Fixtures 1.1.0 reads with a codec pqparser drops on purpose. */
-export function usesBrotli(reader) {
-  return reader.info.compression.includes("brotli");
-}
-
 /** A value made comparable with `assert.deepStrictEqual`, bigints and bytes included. */
 export function plain(v) {
   if (typeof v === "bigint") return `${v}n`;
@@ -75,4 +70,72 @@ export function variableOf(v, { sortEncodings = true } = {}) {
 
 export function bytesOf(path) {
   return readFileSync(path);
+}
+
+// pyarrow's values (scripts/expected.py) against ours, by the rules of
+// dta-parser's crates/parquet/tests/compat.rs (see pyarrow.test.mjs).
+
+const UNITS = ["s", "ms", "us", "ns"];
+
+/** Parse JSON keeping integers beyond the safe ones exact, as bigints. */
+export function parseExact(text) {
+  return JSON.parse(text, (_, v, ctx) => (typeof v === "number" && Number.isInteger(v) && !Number.isSafeInteger(v) && /^-?\d+$/.test(ctx?.source ?? "") ? BigInt(ctx.source) : v));
+}
+
+/** The bits of a double as 16 hex digits. */
+function bits(x) {
+  const d = new DataView(new ArrayBuffer(8));
+  d.setFloat64(0, x);
+  return d.getBigUint64(0).toString(16).padStart(16, "0");
+}
+
+/** The tagged NaN of missing code 2 (`.a`) to 27 (`.z`), as pyarrow prints its bits. */
+function taggedBits(code) {
+  return (0x7ff0000000000000n | (BigInt(0x61 + code - 2) << 32n) | 0x7a2n).toString(16).padStart(16, "0");
+}
+
+/** Row `i` of our column: `{ code }` for a missing number, null for a null, else the value. */
+export function cell(c, i) {
+  switch (c.kind) {
+    case "number":
+      return c.missing[i] ? { code: c.missing[i] } : c.values[i];
+    case "bigint":
+      return c.missing[i] ? null : c.values[i];
+    case "dictionary":
+      return c.missing[i] ? null : c.values[c.codes[i]];
+    default:
+      return c.missing?.[i] ? null : c.values[i];
+  }
+}
+
+/** Whether pyarrow's `want` and our `got` are the same value, for a column of Arrow type `type`. */
+export function same(want, got, type, variable) {
+  const missingCode = got !== null && typeof got === "object" && "code" in got ? got.code : 0;
+  if (want === null) return got === null || missingCode === 1;
+  if (typeof want === "string" && want.startsWith("NaN:")) {
+    const b = want.slice(4);
+    if (b.length === 16 && missingCode >= 2) return b === taggedBits(missingCode);
+    return typeof got === "number" && Number.isNaN(got) && (b.length !== 16 || bits(got) === b);
+  }
+  if (missingCode) return false;
+  if (want === "NaN") return typeof got === "number" && Number.isNaN(got);
+  if (type === "bool") return got === (want ? 1 : 0);
+  // A DECIMAL of more than 15 digits is text, with every digit.
+  if (/^decimal/.test(type)) return typeof got === "string" ? got === want : got === Number(want);
+  const unit = /^(?:timestamp|time\d\d)\[(\w+)/.exec(type)?.[1];
+  if (unit) {
+    // Our values count the Parquet unit; pyarrow's the Arrow type's (ARROW:schema may give another).
+    const shift = UNITS.indexOf(variable.unit) - UNITS.indexOf(unit);
+    const scaled = BigInt(want) * 1000n ** BigInt(Math.max(0, shift));
+    const ours = BigInt(got) * 1000n ** BigInt(Math.max(0, -shift));
+    return scaled === ours;
+  }
+  if (Array.isArray(want)) {
+    const bytes = typeof got === "string" ? Buffer.from(got, "utf8") : got; // an ENUM is text here
+    return bytes instanceof Uint8Array && Buffer.compare(Buffer.from(bytes), Buffer.from(want)) === 0;
+  }
+  if (typeof want === "bigint" || (typeof want === "number" && (typeof got === "bigint" || Number.isInteger(want)))) {
+    return (typeof got === "number" || typeof got === "bigint") && BigInt(got) === BigInt(want);
+  }
+  return Object.is(want, got);
 }
