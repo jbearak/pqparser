@@ -46,7 +46,8 @@ struct HostRead {
 
 impl Read for HostRead {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let n = buf.len().min((self.end - self.at) as usize);
+        // In u64: a file can be larger than wasm32's usize holds.
+        let n = (buf.len() as u64).min(self.end - self.at) as usize;
         if n > 0 {
             if unsafe { host_read(buf.as_mut_ptr(), n, self.at as f64) } != 0 {
                 return Err(std::io::Error::other("reading the file failed"));
@@ -1611,9 +1612,6 @@ mod tests {
     use super::*;
     use arrow_array::NullArray;
 
-    // A column of nulls only is `.` in every row, read as numbers or as
-    // 64-bit integers (an INT64 column of logical type UNKNOWN reads as
-    // the second; no writer at hand makes one, so the array is built here).
     // Offset indexes are read only when they span at most MAX_INDEX_SPAN
     // bytes: arrow-rs reads them in one piece, gaps included.
     #[test]
@@ -1642,6 +1640,9 @@ mod tests {
         assert!(!offset_indexes_fit(&meta(&[(4, 20), (i64::MAX - 5, 20)])));
     }
 
+    // A column of nulls only is `.` in every row, read as numbers or as
+    // 64-bit integers (an INT64 column of logical type UNKNOWN reads as
+    // the second; no writer at hand makes one, so the array is built here).
     #[test]
     fn null_columns_are_missing() {
         let a = NullArray::new(3);
