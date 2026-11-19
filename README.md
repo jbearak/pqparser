@@ -78,7 +78,8 @@ Dropped on purpose:
   pages a read needs (with an offset index; without one, it reads the
   page headers before them too) and keeps none, so neighbouring windows
   decompress a page again. `readRowsAt` reads every row asked for in one
-  pass, so each page it needs is decompressed once.
+  pass, so each page it needs is decompressed once, and skips the rows
+  between them rather than decoding them (arrow-rs's `Selectors` policy).
 - Not here, since table-viewer does not use them: `openParquetAsync` and
   `AsyncParquetReader`, the writers, `characteristics()`, `notes()`,
   `keyValue()`, `readColumns`' `strings: "dictionary"` and
@@ -125,7 +126,10 @@ From arrow-rs:
     page).
   - A file row count that is not the sum of the row groups' (parquet-rs
     0.3 wrote 0) is taken from the row groups.
-  - An offset index that does not read is left out.
+  - An offset index that does not read is left out, and so are offset
+    indexes that span more than 64 MiB of the file (arrow-rs reads them
+    in one piece, gaps included, when the file opens). Without them a
+    read reads the page headers before the pages it needs.
 - arrow-rs turns INT96 into nanoseconds since 1970 with wrapping
   arithmetic, so a timestamp before 1677 or after 2262 (Spark writes
   9999-12-31 so) comes out wrong. pqparser reads INT96 columns again in
