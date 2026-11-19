@@ -73,6 +73,27 @@ patch(
     bytes([0xEC, 0x00, 0x00]),
 )
 
+# 70 structs whose int8 member "x" arrow-rs takes, then one whose "x" is
+# annotated UUID, beside a flat column.
+patch(
+    "misfit_after_many.parquet",
+    pa.table({
+        "flat": [1.5, None, 3.5],
+        **{f"s{k:02}": pa.array([{"x": k}] * 3, pa.struct([("x", pa.int16())])) for k in range(70)},
+        "bad": pa.array([{"x": 1}, None, {"x": 3}], pa.struct([("x", pa.int8())])),
+    }),
+    bytes([0xAC, 0x13, 0x08, 0x11, 0x00, 0x00]),  # logicalType: INTEGER {8, signed}, only on bad.x
+    bytes([0xEC, 0x00, 0x00]),
+)
+
+# A FIXED_LEN_BYTE_ARRAY(4) annotated UUID, named with " for field '" in it.
+patch(
+    "uuid_odd_name.parquet",
+    pa.table({"x for field 'y": pa.array([bytes(range(k, k + 4)) for k in range(3)], pa.binary(4))}),
+    bytes([0x18, 0x0E]) + b"x for field 'y" + bytes([0x00]),
+    bytes([0x18, 0x0E]) + b"x for field 'y" + bytes([0x6C, 0xEC, 0x00, 0x00, 0x00]),
+)
+
 # A FIXED_LEN_BYTE_ARRAY(4) annotated UUID, which needs 16 bytes.
 patch(
     "uuid_four_bytes.parquet",

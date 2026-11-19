@@ -48,6 +48,8 @@ const WARNINGS = {
   misfit_same_name: [/^column "x": its annotation does not fit its physical type, which is read instead \(Logical type Uuid is incompatible with converted type INT_8/],
   misfit_twice: [/^column "x": its annotation does not fit its physical type, which is read instead \(Logical type Uuid is incompatible with converted type INT_8/],
   misfit_quote: [/^column "x'y": its annotation does not fit its physical type, which is read instead \(Logical type Uuid is incompatible with converted type INT_8 for field 'x'y'\)$/],
+  misfit_after_many: [/^column "x": its annotation does not fit its physical type, which is read instead \(Logical type Uuid is incompatible with converted type INT_8/],
+  uuid_odd_name: [/^column "x for field 'y": its annotation does not fit its physical type, which is read instead \(UUID cannot annotate field 'x for field 'y' because/],
   uuid_four_bytes: [/^column "uid": its annotation does not fit its physical type, which is read instead \(UUID cannot annotate field 'uid'/],
   // A DATE converted type with a logical type newer than arrow-rs: both go, as pyarrow reads it.
   unknown_logical_int: [/^column "d": its annotation does not fit its physical type, which is read instead \(Logical type _Unknown/],

@@ -330,13 +330,15 @@ fn misfit(e: &str) -> Option<&str> {
     if !FITS.iter().any(|f| e.contains(f)) {
         return None;
     }
-    // "... for field 'NAME'" at the end, or "... annotate field 'NAME' because ...".
-    if let Some(at) = e.find(" for field '") {
-        return e[at + " for field '".len()..].strip_suffix('\'');
+    // "TYPE cannot annotate field 'NAME' because ...", where TYPE is one
+    // word; else "... for field 'NAME'" at the end, after text of arrow-rs's
+    // own that holds no " for field '".
+    let message = e.strip_prefix("Parquet error: ").unwrap_or(e);
+    if let Some(rest) = message.split_once(' ').and_then(|(_, rest)| rest.strip_prefix("cannot annotate field '")) {
+        return rest.get(..rest.rfind("' because")?);
     }
-    let at = e.find("annotate field '")? + "annotate field '".len();
-    let end = e.rfind("' because")?;
-    e.get(at..end)
+    let at = message.find(" for field '")? + " for field '".len();
+    message[at..].strip_suffix('\'')
 }
 
 /// Whether a column has a logical type newer than arrow-rs.
@@ -610,12 +612,12 @@ fn name_of(fields: &Fields) -> Option<&[u8]> {
 
 /// The footer without the annotation (logical and converted types) of the
 /// elements named `name` that have one whose place among them (from 0) is
-/// in `which`, and how many such elements there are.
+/// in `which` (ascending), and how many such elements there are.
 fn drop_annotation(footer: &[u8], name: &str, which: &[usize]) -> Option<(Vec<u8>, usize)> {
     let mut seen = 0;
     let out = rewrite_schema(footer, |fields| {
         if name_of(fields) == Some(name.as_bytes()) && fields.iter().any(|f| f.0 == 6 || f.0 == 10) {
-            if which.contains(&seen) {
+            if which.binary_search(&seen).is_ok() {
                 fields.retain(|f| f.0 != 6 && f.0 != 10);
             }
             seen += 1;
@@ -628,9 +630,11 @@ fn drop_annotation(footer: &[u8], name: &str, which: &[usize]) -> Option<(Vec<u8
 /// The footer without the annotations arrow-rs refused (error `e`) on
 /// elements named `name`, keeping those of the same name it takes.
 /// arrow-rs names only the first element it refuses, and several may give
-/// the same error: annotations are dropped in order until the error
-/// changes, then each dropped one is put back unless that brings the
-/// error back.
+/// the same error. A binary search finds a first `k` elements whose
+/// annotations, dropped, change the error, where the first `k - 1` do not:
+/// the `k`th is one arrow-rs refuses. If dropping it alone changes the
+/// error, that is all; else each of the others is put back unless that
+/// brings the error back.
 fn drop_misfits(footer: &[u8], name: &str, e: &str) -> Option<Vec<u8>> {
     let fixed = |which: &[usize]| {
         let (f, _) = drop_annotation(footer, name, which)?;
@@ -639,21 +643,30 @@ fn drop_misfits(footer: &[u8], name: &str, e: &str) -> Option<Vec<u8>> {
             Err(again) => (again.to_string() != e).then_some(f),
         }
     };
+    let first = |k: usize| (0..k).collect::<Vec<usize>>();
     let (_, n) = drop_annotation(footer, name, &[])?;
-    let mut which: Vec<usize> = Vec::new();
-    for k in 0..n.min(64) {
-        which.push(k);
-        if fixed(&which).is_some() {
-            for j in which.clone().into_iter().rev().skip(1) {
-                let fewer: Vec<usize> = which.iter().copied().filter(|&x| x != j).collect();
-                if fixed(&fewer).is_some() {
-                    which = fewer;
-                }
-            }
-            return fixed(&which);
+    fixed(&first(n))?;
+    // Dropping none leaves the error; dropping the first `hi` changes it.
+    let (mut lo, mut hi) = (0, n);
+    while hi - lo > 1 {
+        let mid = (lo + hi) / 2;
+        if fixed(&first(mid)).is_some() {
+            hi = mid;
+        } else {
+            lo = mid;
         }
     }
-    None
+    if let Some(f) = fixed(&[hi - 1]) {
+        return Some(f);
+    }
+    let mut which = first(hi);
+    for j in (0..hi - 1).rev() {
+        let fewer: Vec<usize> = which.iter().copied().filter(|&x| x != j).collect();
+        if fixed(&fewer).is_some() {
+            which = fewer;
+        }
+    }
+    fixed(&which)
 }
 
 /// The footer without logical types arrow-rs does not know (Parquet's
