@@ -9,23 +9,28 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-24.04
     env:
       # zstd's C code: Ubuntu's clang targets wasm32.
       CC_wasm32_unknown_unknown: clang
       AR_wasm32_unknown_unknown: llvm-ar
-      # Pinned so that a release can be built again byte for byte.
+      # The Rust each release is built with, named in its notes.
       RUST_VERSION: "1.99.1"
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
       - name: Check the tag
         run: |
+          if ! printf '%s\n' "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "$GITHUB_REF_NAME is not a release tag vX.Y.Z." >&2
+            exit 1
+          fi
           version="v$(node -p 'require("./package.json").version')"
           if [ "$version" != "$GITHUB_REF_NAME" ]; then
             echo "The tag is $GITHUB_REF_NAME but package.json says $version." >&2
@@ -50,29 +55,59 @@ jobs:
       - run: npm test
       - name: Pack
         run: |
-          tarball="$(npm pack --silent)"
-          sha256sum "$tarball" > "$tarball.sha256"
-          echo "TARBALL=$tarball" >> "$GITHUB_ENV"
-      - name: Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
+          mkdir release
+          tarball="$(npm pack --silent --pack-destination release)"
+          (cd release && sha256sum "$tarball" > "$tarball.sha256")
           {
             echo "Built and tested by the release workflow from $GITHUB_SHA."
             echo
             echo '```'
-            cat "$TARBALL.sha256"
+            cat "release/$tarball.sha256"
             echo '```'
             echo
             echo "- $(rustc --version)"
             echo "- $(clang --version | head -n 1)"
             echo "- Node $(node --version)"
             echo
-            echo "Install with npm from the tarball's URL:"
+            echo "Install with npm from the tarball's URL, which records the tarball's sha512 in package-lock.json:"
             echo
             echo '```'
-            echo "npm install https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$TARBALL"
+            echo "npm install https://github.com/$GITHUB_REPOSITORY/releases/download/$GITHUB_REF_NAME/$tarball"
             echo '```'
           } > notes.md
-          gh release create "$GITHUB_REF_NAME" "$TARBALL" "$TARBALL.sha256" \
-            --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
+          mv notes.md release/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release
+          path: release/
+          if-no-files-found: error
+
+  # Only this job can write, and it runs no code from the repository.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release
+          path: release
+      - name: Check the tag still names the commit that was built
+        run: |
+          sha="$(gh api "repos/$GH_REPO/commits/$GITHUB_REF_NAME" --jq .sha)"
+          if [ "$sha" != "$GITHUB_SHA" ]; then
+            echo "$GITHUB_REF_NAME now names $sha, not $GITHUB_SHA, which was built." >&2
+            exit 1
+          fi
+      - name: Release
+        working-directory: release
+        run: |
+          # A draft until every file is attached, so a failed upload leaves
+          # no release that looks finished.
+          gh release create "$GITHUB_REF_NAME" pqparser-*.tgz pqparser-*.tgz.sha256 \
+            --draft --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
+          gh release edit "$GITHUB_REF_NAME" --draft=false

@@ -194,10 +194,16 @@ with pqparser and 1.1.0. `python3 scripts/notices.py` writes
 Set `version` in `package.json` (and `package-lock.json`), merge to
 main, then tag the merge commit `v` and the version and push the tag.
 The release workflow (`.github/workflows/release.yml`) checks that the
-tag matches `package.json` and is on main, builds and tests the package
-with a pinned Rust, and attaches `npm pack`'s tarball and its SHA-256
-to a GitHub release of the tag. A release, once made, is not replaced:
-a fix is a new version.
+tag is `vX.Y.Z`, matches `package.json` and is on main; builds and tests
+the package with Rust 1.99.1 on Ubuntu 24.04; and attaches `npm pack`'s
+tarball and its SHA-256 to a GitHub release of the tag, made as a draft
+and published once both files are attached. If a run fails after
+making the draft, delete the draft before running it again.
+
+A consumer's `package-lock.json` records the tarball's sha512, so a
+release, once made, is never replaced: a fix is a new version. The wasm
+is not reproducible byte for byte (arrow-rs's hashing takes randomness
+at compile time), so a tarball built again does not match.
 
 ## Size
 
