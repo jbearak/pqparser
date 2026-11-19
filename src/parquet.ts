@@ -735,12 +735,12 @@ export class ParquetReader implements TableReader {
     }
     // Codecs the module does not read are named before any read.
     const groups = this.info.rowGroups;
-    for (const [j, k] of distinct.entries()) {
+    const unread = this.info.compression.some((c) => !CODECS.has(c));
+    for (const [j, k] of unread ? distinct.entries() : []) {
       for (let g = 0; g < groups.length && count > 0; g++) {
         const { firstRow, rows } = groups[g];
         const codec = vars[j].chunks[g]?.codec;
-        const read = ranges.some(([start, n]) => n > 0 && firstRow < start + n && firstRow + rows > start);
-        if (read && codec && !CODECS.has(codec)) {
+        if (codec && !CODECS.has(codec) && ranges.some(([start, n]) => n > 0 && firstRow < start + n && firstRow + rows > start)) {
           throw dtaError("DTA_INVALID", `column ${JSON.stringify(this.variables[k].name)}: ${codec} compression is not supported by pqparser`, undefined, TypeError);
         }
       }
@@ -822,7 +822,9 @@ export class ParquetReader implements TableReader {
     const out: [number, number][] = [];
     const end = start + count;
     let at = start;
-    for (const g of this.info.rowGroups) {
+    const groups = this.info.rowGroups;
+    for (let k = this.groupOf(start); k < groups.length; k++) {
+      const g = groups[k];
       const groupEnd = Math.min(end, g.firstRow + g.rows);
       if (groupEnd <= at) continue;
       while (at < groupEnd) {
@@ -835,6 +837,18 @@ export class ParquetReader implements TableReader {
       if (at >= end) break;
     }
     return out;
+  }
+
+  /** The first row group that ends after row `row` (binary search). */
+  private groupOf(row: number): number {
+    const groups = this.info.rowGroups;
+    let [lo, hi] = [0, groups.length];
+    while (lo < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (groups[mid].firstRow + groups[mid].rows <= row) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
   }
 
   /** Release the file (and close it, if `openParquetFile` opened it by path). Further reads throw. */

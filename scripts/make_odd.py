@@ -16,14 +16,14 @@ OUT = os.path.join(os.path.dirname(__file__), "..", "test", "fixtures", "odd")
 os.makedirs(OUT, exist_ok=True)
 
 
-def patch(name, table, old, new, **kw):
-    """Write `table`, then replace the one `old` in its footer with `new`."""
+def patch(name, table, old, new, times=1, **kw):
+    """Write `table`, then replace the `times` copies of `old` in its footer with `new`."""
     path = os.path.join(OUT, name)
     pq.write_table(table, path, **kw)
     b = open(path, "rb").read()
     n = struct.unpack("<I", b[-8:-4])[0]
     footer = b[-8 - n : -8]
-    assert footer.count(old) == 1, (name, footer.count(old))
+    assert footer.count(old) == times, (name, footer.count(old))
     footer = footer.replace(old, new)
     open(path, "wb").write(b[: -8 - n] + footer + struct.pack("<I", len(footer)) + b"PAR1")
 
@@ -50,6 +50,27 @@ patch(
     pa.table({"x": ["a", None, "c"], "nest": pa.array([{"x": 1}, {"x": 2}, None], pa.struct([("x", pa.int8())]))}),
     bytes([0xAC, 0x13, 0x08, 0x11, 0x00, 0x00]),  # logicalType: INTEGER {8, signed}
     bytes([0xEC, 0x00, 0x00]),  # logicalType: UUID {}
+)
+
+# The same in two structs, which give arrow-rs's same error twice.
+patch(
+    "misfit_twice.parquet",
+    pa.table({
+        "x": ["a", None, "c"],
+        "one": pa.array([{"x": 1}, {"x": 2}, None], pa.struct([("x", pa.int8())])),
+        "two": pa.array([{"x": 3}, None, {"x": 5}], pa.struct([("x", pa.int8())])),
+    }),
+    bytes([0xAC, 0x13, 0x08, 0x11, 0x00, 0x00]),
+    bytes([0xEC, 0x00, 0x00]),
+    times=2,
+)
+
+# An int8 column whose name has an apostrophe, annotated UUID.
+patch(
+    "misfit_quote.parquet",
+    pa.table({"x'y": pa.array([1, None, 3], pa.int8()), "z": [1.5, 2.5, None]}),
+    bytes([0xAC, 0x13, 0x08, 0x11, 0x00, 0x00]),
+    bytes([0xEC, 0x00, 0x00]),
 )
 
 # A FIXED_LEN_BYTE_ARRAY(4) annotated UUID, which needs 16 bytes.

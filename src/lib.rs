@@ -267,14 +267,8 @@ fn load(file: &Host) -> Result<Loaded, String> {
             // An annotation that does not fit the physical type (UUID on an
             // INT32, TIMESTAMP on a FIXED_LEN_BYTE_ARRAY): the column is read
             // as its physical type, as parquet-testing's README asks. Only
-            // the element named whose annotation was refused: among elements
-            // of that name, the first whose dropped annotation changes
-            // arrow-rs's answer.
-            let mended =
-                (0..).map_while(|nth| drop_annotation(&footer, name, nth)).find(|f| match ParquetMetaDataReader::decode_metadata(f) {
-                    Ok(_) => true,
-                    Err(again) => again.to_string() != e,
-                });
+            // the elements of that name whose annotation was refused.
+            let mended = drop_misfits(&footer, name, &e);
             if mended.is_some() {
                 ignored.push((name.to_string(), e.trim_start_matches("Parquet error: ").to_string()));
             }
@@ -336,9 +330,13 @@ fn misfit(e: &str) -> Option<&str> {
     if !FITS.iter().any(|f| e.contains(f)) {
         return None;
     }
-    let at = e.find("field '")? + "field '".len();
-    let len = e[at..].find('\'')?;
-    Some(&e[at..at + len])
+    // "... for field 'NAME'" at the end, or "... annotate field 'NAME' because ...".
+    if let Some(at) = e.find(" for field '") {
+        return e[at + " for field '".len()..].strip_suffix('\'');
+    }
+    let at = e.find("annotate field '")? + "annotate field '".len();
+    let end = e.rfind("' because")?;
+    e.get(at..end)
 }
 
 /// Whether a column has a logical type newer than arrow-rs.
@@ -611,19 +609,51 @@ fn name_of(fields: &Fields) -> Option<&[u8]> {
 }
 
 /// The footer without the annotation (logical and converted types) of the
-/// `nth` element (from 0) named `name` that has one, if there is one.
-fn drop_annotation(footer: &[u8], name: &str, nth: usize) -> Option<Vec<u8>> {
+/// elements named `name` that have one whose place among them (from 0) is
+/// in `which`, and how many such elements there are.
+fn drop_annotation(footer: &[u8], name: &str, which: &[usize]) -> Option<(Vec<u8>, usize)> {
     let mut seen = 0;
     let out = rewrite_schema(footer, |fields| {
         if name_of(fields) == Some(name.as_bytes()) && fields.iter().any(|f| f.0 == 6 || f.0 == 10) {
-            if seen == nth {
+            if which.contains(&seen) {
                 fields.retain(|f| f.0 != 6 && f.0 != 10);
             }
             seen += 1;
         }
         Some(())
     })?;
-    (seen > nth).then_some(out)
+    Some((out, seen))
+}
+
+/// The footer without the annotations arrow-rs refused (error `e`) on
+/// elements named `name`, keeping those of the same name it takes.
+/// arrow-rs names only the first element it refuses, and several may give
+/// the same error: annotations are dropped in order until the error
+/// changes, then each dropped one is put back unless that brings the
+/// error back.
+fn drop_misfits(footer: &[u8], name: &str, e: &str) -> Option<Vec<u8>> {
+    let fixed = |which: &[usize]| {
+        let (f, _) = drop_annotation(footer, name, which)?;
+        match ParquetMetaDataReader::decode_metadata(&f) {
+            Ok(_) => Some(f),
+            Err(again) => (again.to_string() != e).then_some(f),
+        }
+    };
+    let (_, n) = drop_annotation(footer, name, &[])?;
+    let mut which: Vec<usize> = Vec::new();
+    for k in 0..n.min(64) {
+        which.push(k);
+        if fixed(&which).is_some() {
+            for j in which.clone().into_iter().rev().skip(1) {
+                let fewer: Vec<usize> = which.iter().copied().filter(|&x| x != j).collect();
+                if fixed(&fewer).is_some() {
+                    which = fewer;
+                }
+            }
+            return fixed(&which);
+        }
+    }
+    None
 }
 
 /// The footer without logical types arrow-rs does not know (Parquet's
@@ -637,11 +667,12 @@ fn drop_unknown_logical(footer: &[u8]) -> Option<Vec<u8>> {
 
 /// The footer without the text annotations (STRING, ENUM and JSON, as
 /// logical or converted types), so that arrow-rs reads text as bytes.
-fn drop_text(footer: &[u8]) -> Option<Vec<u8>> {
+/// With `all` false, only JSON's.
+fn drop_text(footer: &[u8], all: bool) -> Option<Vec<u8>> {
     rewrite_schema(footer, |fields| {
         let text = fields.iter().any(|(id, ty, v)| match (id, ty) {
-            (10, 12) => logical_of(v).is_some_and(|(k, _)| matches!(k, 1 | 4 | 12)),
-            (6, 5) => Thrift { b: v, at: 0 }.i32().is_some_and(|c| matches!(c, 0 | 4 | 19)),
+            (10, 12) => logical_of(v).is_some_and(|(k, _)| k == 12 || (all && matches!(k, 1 | 4))),
+            (6, 5) => Thrift { b: v, at: 0 }.i32().is_some_and(|c| c == 19 || (all && matches!(c, 0 | 4))),
             _ => false,
         });
         if text {
@@ -1126,11 +1157,10 @@ fn add_bytes(
     text: bool,
     col: &Column,
 ) -> Result<(), Fail> {
-    // Text: each value not UTF-8 (read as bytes, see `State::lossy`, or a
-    // JSON column, which arrow-rs does not check) is mended, its bad bytes
-    // each replaced by U+FFFD.
-    let put = |bytes: &mut Vec<u8>, v: &[u8]| match String::from_utf8_lossy(v) {
-        std::borrow::Cow::Owned(s) if text => bytes.extend_from_slice(s.as_bytes()),
+    // Text: each value not UTF-8 (read as bytes: see `State::lossy` and
+    // `arrow_meta`) is mended, its bad bytes each replaced by U+FFFD.
+    let put = |bytes: &mut Vec<u8>, v: &[u8]| match text.then(|| String::from_utf8_lossy(v)) {
+        Some(std::borrow::Cow::Owned(s)) => bytes.extend_from_slice(s.as_bytes()),
         _ => bytes.extend_from_slice(v),
     };
     if let Some(d) = a.as_dictionary_opt::<Int32Type>() {
@@ -1236,12 +1266,23 @@ fn utf16_ends(bytes: &[u8], ends: &[u32]) -> Option<Vec<u32>> {
 fn selection(meta: &ParquetMetaData, ranges: &[(u64, u64)]) -> (Vec<usize>, Vec<RowSelector>) {
     let (mut groups, mut select) = (Vec::new(), Vec::new());
     let mut first = 0u64;
+    // The first range that may reach the current row group.
+    let mut next = 0;
     for (g, rg) in meta.row_groups().iter().enumerate() {
         let n = rg.num_rows().max(0) as u64;
         let (a, b) = (first, first + n);
         first = b;
+        while next < ranges.len() && ranges[next].0 + ranges[next].1 <= a {
+            next += 1;
+        }
+        if next == ranges.len() {
+            break;
+        }
         let mut at = a;
-        for &(start, count) in ranges {
+        for &(start, count) in &ranges[next..] {
+            if start >= b {
+                break;
+            }
             let (s, e) = (start.max(a), (start + count).min(b));
             if s >= e {
                 continue;
@@ -1265,16 +1306,25 @@ fn selection(meta: &ParquetMetaData, ranges: &[(u64, u64)]) -> (Vec<usize>, Vec<
 /// How arrow-rs is to read the file: the Parquet types alone
 /// (ARROW:schema could change units), with text stored as a dictionary in
 /// every row group read as one, so that each distinct value is copied out
-/// once; when `state.lossy`, text is read as bytes.
+/// once; when `state.lossy`, text is read as bytes. JSON is always read as
+/// bytes: arrow-rs does not check that it is UTF-8, so a Utf8 array of it
+/// could hold bytes that are not.
 fn arrow_meta(state: &State) -> Result<ArrowReaderMetadata, String> {
     let options = ArrowReaderOptions::new().with_skip_arrow_metadata(true);
     let plain = ArrowReaderMetadata::try_new(state.meta.clone(), options.clone()).map_err(|e| e.to_string())?;
-    let meta = if state.lossy {
+    let roots = state.meta.file_metadata().schema_descr().root_schema().get_fields();
+    let json = |k: usize| {
+        let info = roots[k].get_basic_info();
+        roots[k].is_primitive()
+            && (matches!(info.logical_type_ref(), Some(LogicalType::Json)) || info.converted_type() == parquet::basic::ConvertedType::JSON)
+    };
+    let any_json = (0..roots.len()).any(json);
+    let meta = if state.lossy || any_json {
         let footer = match &state.footer {
             Some(f) => f.clone(),
             None => footer_bytes(&state.file)?,
         };
-        let footer = drop_text(&footer).ok_or("the footer could not be read again")?;
+        let footer = drop_text(&footer, state.lossy).ok_or("the footer could not be read again")?;
         let bare = ParquetMetaDataReader::decode_metadata(&footer).map_err(|e| e.to_string())?;
         let index = ParquetMetaDataBuilder::from(state.meta.as_ref().clone()).take_page_index();
         Arc::new(true_rows(ParquetMetaDataBuilder::from(bare).set_page_index(index).build()))
@@ -1286,7 +1336,6 @@ fn arrow_meta(state: &State) -> Result<ArrowReaderMetadata, String> {
         let leaf = (0..descr.num_columns()).find(|&l| descr.get_column_root_idx(l) == root);
         leaf.is_some_and(|l| state.meta.row_groups().iter().all(|g| g.column(l).dictionary_page_offset().is_some()))
     };
-    let text = if state.lossy { DataType::Binary } else { DataType::Utf8 };
     let fields: Vec<_> = plain
         .schema()
         .fields()
@@ -1294,7 +1343,8 @@ fn arrow_meta(state: &State) -> Result<ArrowReaderMetadata, String> {
         .enumerate()
         .map(|(k, f)| match f.data_type() {
             DataType::Utf8 => {
-                let t = if coded(k) { DataType::Dictionary(Box::new(DataType::Int32), Box::new(text.clone())) } else { text.clone() };
+                let text = if state.lossy || json(k) { DataType::Binary } else { DataType::Utf8 };
+                let t = if coded(k) { DataType::Dictionary(Box::new(DataType::Int32), Box::new(text.clone())) } else { text };
                 Arc::new(f.as_ref().clone().with_data_type(t))
             }
             _ => f.clone(),

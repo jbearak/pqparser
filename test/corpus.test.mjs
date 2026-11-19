@@ -46,6 +46,8 @@ const WARNINGS = {
   int32_with_uuid_logical_type: [/^column "int32_uuid": its annotation does not fit its physical type, which is read instead \(Cannot annotate Uuid from INT32/],
   // Only the struct's member loses its annotation, not the text column of the same name.
   misfit_same_name: [/^column "x": its annotation does not fit its physical type, which is read instead \(Logical type Uuid is incompatible with converted type INT_8/],
+  misfit_twice: [/^column "x": its annotation does not fit its physical type, which is read instead \(Logical type Uuid is incompatible with converted type INT_8/],
+  misfit_quote: [/^column "x'y": its annotation does not fit its physical type, which is read instead \(Logical type Uuid is incompatible with converted type INT_8 for field 'x'y'\)$/],
   uuid_four_bytes: [/^column "uid": its annotation does not fit its physical type, which is read instead \(UUID cannot annotate field 'uid'/],
   // A DATE converted type with a logical type newer than arrow-rs: both go, as pyarrow reads it.
   unknown_logical_int: [/^column "d": its annotation does not fit its physical type, which is read instead \(Logical type _Unknown/],
